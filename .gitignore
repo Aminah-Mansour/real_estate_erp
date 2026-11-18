@@ -1,0 +1,10 @@
+.venv/
+.env
+.env.*
+!.env.example
+_pycache_/
+*.pyc
+.pytest_cache/
+.aws/
+*.pem
+*.key
