@@ -1,4 +1,4 @@
-{% from "_icons.html" import icon, emblem %}
+{% from "_icons.html" import icon, skyline %}
 <!doctype html>
 <html lang="{{ lang }}" dir="{{ dir }}">
 <head>
@@ -6,57 +6,47 @@
   <title>{{ t('login_title') }} · {{ t('app_name') }}</title>
 </head>
 <body class="auth">
-<div class="auth-layout">
-  <section class="auth-hero" aria-hidden="true">
-    <div class="auth-hero-inner">
-      <div class="brand brand-lg">
-        {{ emblem() }}
-        <span class="brand-text"><strong>{{ t('app_name') }}</strong><small>{{ t('app_tagline') }}</small></span>
-      </div>
-      <h2>{{ t('login_hero_title') }}</h2>
-      <p>{{ t('login_hero_text') }}</p>
-      <ul class="hero-points">
-        <li>{{ icon('check') }}<span>{{ t('control_four_eyes') }}</span></li>
-        <li>{{ icon('check') }}<span>{{ t('control_audit') }}</span></li>
-        <li>{{ icon('check') }}<span>{{ t('control_tax') }}</span></li>
-      </ul>
-    </div>
-  </section>
+{{ skyline('auth-skyline') }}
 
-  <section class="auth-panel">
-    <div class="auth-top">
-      <span class="pill pill-dev"><span class="dot"></span>{{ t('dev_data') }}</span>
-      <a class="btn btn-ghost" href="/lang/{{ 'en' if lang == 'ar' else 'ar' }}?next=/login"
-         lang="{{ 'en' if lang == 'ar' else 'ar' }}">{{ icon('globe') }}<span>{{ t('switch_language') }}</span></a>
-    </div>
+<main class="login-card">
+  <span class="pill pill-dev login-dev"><span class="dot"></span>{{ t('dev_data') }}</span>
 
-    <div class="auth-card card">
-      <div class="auth-card-head">
-        <span class="icon-chip icon-chip-copper">{{ icon('lock') }}</span>
-        <div>
-          <h1>{{ t('login_title') }}</h1>
-          <p class="muted">{{ t('login_subtitle') }}</p>
-        </div>
-      </div>
+  <div class="login-brand">
+    <img class="login-logo" src="/static/img/capnova-logo.png" alt="CAPNOVA · كابنوفا" width="300" height="210">
+    <p class="login-product">{{ t('product_name') }}</p>
+    <p class="login-tagline">{{ t('app_tagline') }}</p>
+  </div>
 
-      {% if error %}<div class="alert alert-error" role="alert">{{ icon('info') }}<span>{{ t(error) }}</span></div>{% endif %}
-      {% if notice %}<div class="alert alert-info" role="status">{{ icon('info') }}<span>{{ t(notice) }}</span></div>{% endif %}
+  <h1 class="sr-only">{{ t('login_title') }}</h1>
 
-      <form method="post" action="/login" class="form" autocomplete="on">
-        <input type="hidden" name="csrf" value="{{ csrf }}">
-        <label class="field">
-          <span>{{ t('email') }}</span>
-          <input type="email" name="email" value="{{ email }}" required autocomplete="username" dir="ltr" inputmode="email" autofocus>
-        </label>
-        <label class="field">
-          <span>{{ t('password') }}</span>
-          <input type="password" name="password" required autocomplete="current-password" dir="ltr">
-        </label>
-        <button type="submit" class="btn btn-copper btn-block">{{ t('sign_in') }}</button>
-      </form>
-      <p class="auth-note">{{ icon('lock', 'icon icon-sm') }}<span>{{ t('login_secure_note') }}</span></p>
-    </div>
-  </section>
-</div>
+  {% if error %}<div class="alert alert-error" role="alert">{{ icon('info') }}<span>{{ t(error) }}</span></div>{% endif %}
+  {% if notice %}<div class="alert alert-info" role="status">{{ icon('info') }}<span>{{ t(notice) }}</span></div>{% endif %}
+
+  <form method="post" action="/login" class="form login-form" autocomplete="on">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label class="input-icon">
+      <span class="sr-only">{{ t('email') }}</span>
+      {{ icon('user') }}
+      <input type="email" name="email" value="{{ email }}" placeholder="{{ t('email') }}" required
+             autocomplete="username" inputmode="email" autofocus>
+    </label>
+    <label class="input-icon">
+      <span class="sr-only">{{ t('password') }}</span>
+      {{ icon('lock') }}
+      <input type="password" name="password" placeholder="{{ t('password') }}" required autocomplete="current-password">
+    </label>
+    <button type="submit" class="btn btn-emerald btn-block">{{ t('login_title') }}</button>
+  </form>
+
+  <nav class="lang-switch lang-switch-center" aria-label="{{ t('language') }}">
+    {{ icon('globe', 'icon icon-sm') }}
+    <a href="/lang/en?next=/login" lang="en"{% if lang == 'en' %} class="is-current" aria-current="true"{% endif %}>EN</a>
+    <span class="sep" aria-hidden="true"></span>
+    <a href="/lang/ar?next=/login" lang="ar"{% if lang == 'ar' %} class="is-current" aria-current="true"{% endif %}>عربي</a>
+  </nav>
+
+  <p class="auth-note">{{ icon('lock', 'icon icon-sm') }}<span>{{ t('login_secure_note') }}</span></p>
+  <span class="login-swoosh" aria-hidden="true"></span>
+</main>
 </body>
 </html>

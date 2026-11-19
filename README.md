@@ -18,11 +18,13 @@ uv run real-estate-erp serve    # then open http://127.0.0.1:8000
 `dev_setup.sh` creates `.env` with random development passwords (never committed), starts PostgreSQL 16 on
 `127.0.0.1:5433`, installs the schema with Alembic, creates the database logins, loads the Jeddah seed and
 creates the administrator **Admin** (`admin@office.local` by default); you choose the password at the
-prompt. It is never stored in code or in the database, only its Argon2id hash.
+prompt (see [Password policy](#password-policy)). It is never stored in code or in the database, only its
+Argon2id hash.
 
 The MVP is FastAPI + Jinja2, Arabic by default (right-to-left) with English, Western digits and SAR:
 
 - **Sign-in**: administrator only in this version. 5 failed attempts lock the account for 15 minutes.
+  Passwords follow the [password policy](#password-policy).
   The session cookie is `HttpOnly`, `Secure` and `SameSite=Strict`; forms carry CSRF tokens. Open the app at
   `http://127.0.0.1:8000` (browsers accept secure cookies on localhost).
 - **Dashboard**: summary cards (lands, purchase price, 5% purchase tax, 2.5% Dalalah, total acquisition
@@ -225,6 +227,35 @@ can call neither.
 
 `user_credentials` stores only an **Argon2id hash** produced by the application, never a plain password,
 plus lockout and MFA fields for the future login service.
+
+### Password policy
+
+One policy for every environment (development and production), following NIST SP 800-63B. It lives in
+`src/real_estate_erp/password_policy.py` and is applied wherever a password is set (today:
+`real-estate-erp create-admin`).
+
+- **Length**: 8 to 128 characters. Long passphrases are encouraged.
+- **Any characters**: spaces, Arabic letters, symbols and emoji are all allowed. There are **no composition
+  rules** (no required digit, capital or symbol).
+- **No forced changes**: passwords do not expire. Change one only when it may have been exposed.
+- **Rejected**:
+  - passwords found in breach corpora or lists of common passwords. The check is offline, against a bundled
+    list of 75,588 passwords of 8+ characters (`src/real_estate_erp/data/common-passwords.txt.gz`). It is
+    built from SecLists (MIT licence): the UK NCSC top 100k from Have I Been Pwned, Pwdb top 100k and
+    xato-net top 100k. Comparison ignores case, and digits or symbols added around a listed word
+    (`Password123!`);
+  - one repeated character or two alternating ones, and alphabet, number or keyboard runs (Latin and
+    Arabic);
+  - the service name (`CAPNOVA`, `كابنوفا`) anywhere in the password, generic words such as `admin`,
+    `office` or `erp` as the whole password, and the account's own email address or its name parts.
+- **Unicode**: passwords are NFKC-normalized before hashing and before verification, so the same text typed
+  on different keyboards gives the same password.
+- **Storage and sign-in**: Argon2id (argon2-cffi's RFC 9106 parameters). Unknown accounts take the same
+  verification time as real ones. 5 consecutive failures lock the account for 15 minutes. Sessions are
+  random 256-bit tokens stored only as SHA-256 hashes, with `HttpOnly`, `Secure`, `SameSite=Strict`
+  cookies, an 8-hour lifetime, and revocation on sign-out.
+
+Rejection messages explain the reason but never repeat the password.
 
 ## Development seed data
 

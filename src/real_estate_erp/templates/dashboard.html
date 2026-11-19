@@ -1,42 +1,92 @@
 {% extends "base.html" %}
 {% from "_icons.html" import icon %}
 {% block title %}{{ t('dashboard_title') }}{% endblock %}
-{% block heading %}{{ t('welcome') }}{{ '، ' if lang == 'ar' else ', ' }}{{ employee.full_name }}{% endblock %}
-{% block subheading %}<p class="topbar-sub">{{ t('dashboard_intro') }}</p>{% endblock %}
+{% block heading %}{{ t('welcome_brand') }}{% endblock %}
+{% block subheading %}<p class="topbar-sub">{{ t('app_tagline') }}</p>
+<p class="hero-user">{{ t('signed_in_as') }} <strong>{{ employee.full_name }}</strong> · {{ t('role_' ~ employee.role) }}</p>{% endblock %}
 {% block content %}
+
+<section class="kpis" aria-label="{{ t('dashboard_title') }}">
+  <article class="kpi kpi-feature">
+    {{ icon('map-pin', 'icon kpi-icon') }}
+    <p class="kpi-label">{{ t('nav_lands') }}</p>
+    <p class="kpi-value">{{ count(totals.land_count) }}</p>
+    <p class="kpi-foot">{{ t('card_total_area') }}: {{ qty(totals.area_sqm, 'sqm') }}</p>
+  </article>
+  <article class="kpi">
+    {{ icon('handshake', 'icon kpi-icon') }}
+    <p class="kpi-label">{{ t('nav_deals') }}</p>
+    <p class="kpi-value">{{ count(counts.deals) }}</p>
+  </article>
+  <article class="kpi">
+    {{ icon('layers', 'icon kpi-icon') }}
+    <p class="kpi-label">{{ t('nav_portfolios') }}</p>
+    <p class="kpi-value">{{ count(counts.portfolios) }}</p>
+  </article>
+  <article class="kpi">
+    {{ icon('investors', 'icon kpi-icon') }}
+    <p class="kpi-label">{{ t('nav_investors') }}</p>
+    <p class="kpi-value">{{ count(counts.investors) }}</p>
+  </article>
+</section>
 
 <div class="notice">
   {{ icon('info') }}<span>{{ t('preview_note') }}</span>
 </div>
 
-<section class="stats" aria-label="{{ t('dashboard_title') }}">
-  <article class="stat card">
-    <span class="icon-chip">{{ icon('lands') }}</span>
-    <p class="stat-label">{{ t('card_lands') }}</p>
-    <p class="stat-value">{{ count(totals.land_count) }}</p>
-    <p class="stat-foot">{{ t('card_total_area') }}: {{ qty(totals.area_sqm, 'sqm') }}</p>
-  </article>
-  <article class="stat card">
-    <span class="icon-chip">{{ icon('coins') }}</span>
-    <p class="stat-label">{{ t('card_purchase_price') }}</p>
-    <p class="stat-value">{{ money(totals.purchase_price) }}</p>
-  </article>
-  <article class="stat card">
-    <span class="icon-chip">{{ icon('receipt') }}</span>
-    <p class="stat-label">{{ t('card_purchase_tax') }}</p>
-    <p class="stat-value">{{ money(totals.purchase_tax) }}</p>
-  </article>
-  <article class="stat card">
-    <span class="icon-chip">{{ icon('handshake') }}</span>
-    <p class="stat-label">{{ t('card_dalalah') }}</p>
-    <p class="stat-value">{{ money(totals.dalalah) }}</p>
-  </article>
-  <article class="stat card stat-feature">
-    <span class="icon-chip icon-chip-copper">{{ icon('sigma') }}</span>
-    <p class="stat-label">{{ t('card_total_cost') }}</p>
-    <p class="stat-value">{{ money(totals.total_acquisition_cost) }}</p>
-  </article>
-</section>
+<div class="grid-2">
+  <section class="card panel chart-card">
+    <header class="panel-head">
+      <div>
+        <h2>{{ t('chart_title') }}</h2>
+        <p class="panel-sub">{{ t('chart_note') }}</p>
+      </div>
+      <ul class="legend" aria-hidden="true">
+        <li><span class="swatch seg-price"></span>{{ t('purchase_price') }}</li>
+        <li><span class="swatch seg-tax"></span>{{ t('purchase_tax') }}</li>
+        <li><span class="swatch seg-dalalah"></span>{{ t('dalalah') }}</li>
+      </ul>
+    </header>
+    {% if lands %}
+    {% set max_total = lands | map(attribute='total_acquisition_cost') | max %}
+    <ul class="cost-chart">
+      {% for land in lands %}
+      {% set wp = land.purchase_price / max_total * 100 %}
+      {% set wt = land.purchase_tax / max_total * 100 %}
+      {% set wd = land.dalalah / max_total * 100 %}
+      <li>
+        <span class="cost-label">
+          <strong>{{ t('plan_number') }} <bdi dir="{{ dir }}">{{ land.plan_number }}</bdi></strong>
+          <small>{{ t('land_number') }} <bdi dir="{{ dir }}">{{ land.land_number }}</bdi></small>
+        </span>
+        <span class="cost-bar">
+          <svg class="bar-svg" viewBox="0 0 100 10" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+            <rect class="seg-track" x="0" y="0" width="100" height="10"/>
+            <rect class="seg-price" x="0" y="0" width="{{ '%.3f' | format(wp) }}" height="10"/>
+            <rect class="seg-tax" x="{{ '%.3f' | format(wp) }}" y="0" width="{{ '%.3f' | format(wt) }}" height="10"/>
+            <rect class="seg-dalalah" x="{{ '%.3f' | format(wp + wt) }}" y="0" width="{{ '%.3f' | format(wd) }}" height="10"/>
+          </svg>
+        </span>
+        <span class="cost-total">{{ money(land.total_acquisition_cost) }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">{{ t('no_lands') }}</p>
+    {% endif %}
+  </section>
+
+  <section class="card panel total-card">
+    <span class="total-icon">{{ icon('building', 'icon icon-lg') }}</span>
+    <p class="total-label">{{ t('card_total_cost') }}</p>
+    <p class="total-value">{{ money(totals.total_acquisition_cost) }}</p>
+    <ul class="total-breakdown" aria-label="{{ t('breakdown_title') }}">
+      <li><span>{{ t('card_purchase_price') }}</span><span>{{ money(totals.purchase_price) }}</span></li>
+      <li><span>{{ t('card_purchase_tax') }}</span><span>{{ money(totals.purchase_tax) }}</span></li>
+      <li><span>{{ t('card_dalalah') }}</span><span>{{ money(totals.dalalah) }}</span></li>
+    </ul>
+  </section>
+</div>
 
 <div class="grid-2">
   <section class="card panel">
@@ -79,38 +129,21 @@
     {% endif %}
   </section>
 
-  <div class="stack">
-    <section class="card panel">
-      <header class="panel-head"><h2>{{ t('status_breakdown') }}</h2></header>
-      <ul class="bars">
-        {% for row in statuses %}
-        <li>
-          <span class="bar-label">{{ t('status_' ~ row.status) }}</span>
-          <progress class="bar-track" value="{{ row.n }}" max="{{ totals.land_count or 1 }}">{{ row.n }}</progress>
-          <span class="bar-value">{{ count(row.n) }}</span>
-        </li>
-        {% else %}
-        <li class="empty">{{ t('no_lands') }}</li>
-        {% endfor %}
-      </ul>
-    </section>
-
-    <section class="card panel">
-      <header class="panel-head"><h2>{{ t('recent_activity') }}</h2></header>
-      <ul class="activity">
-        {% for item in activity %}
-        <li>
-          <span class="activity-icon">{{ icon('activity', 'icon icon-sm') }}</span>
-          <span class="activity-text">
-            <strong>{{ action_label(item.action) }}</strong> · {{ entity_label(item.entity_type) }}
-            <small>{{ item.actor or '—' }} · {{ ts(item.occurred_at) }}</small>
-          </span>
-        </li>
-        {% else %}
-        <li class="empty">{{ t('no_activity') }}</li>
-        {% endfor %}
-      </ul>
-    </section>
-  </div>
+  <section class="card panel">
+    <header class="panel-head"><h2>{{ t('recent_activity') }}</h2></header>
+    <ul class="activity">
+      {% for item in activity %}
+      <li>
+        <span class="activity-icon">{{ icon('activity', 'icon icon-sm') }}</span>
+        <span class="activity-text">
+          <strong>{{ action_label(item.action) }}</strong> · {{ entity_label(item.entity_type) }}
+          <small>{{ item.actor or '—' }} · {{ ts(item.occurred_at) }}</small>
+        </span>
+      </li>
+      {% else %}
+      <li class="empty">{{ t('no_activity') }}</li>
+      {% endfor %}
+    </ul>
+  </section>
 </div>
 {% endblock %}

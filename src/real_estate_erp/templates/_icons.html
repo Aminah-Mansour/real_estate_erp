@@ -23,7 +23,25 @@
 {%- elif name == "arrow" -%}<path d="M5 12h14M13 6l6 6-6 6"/>
 {%- elif name == "activity" -%}<path d="M3 12h4l3-8 4 16 3-8h4"/>
 {%- elif name == "sparkle" -%}<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/>
+{%- elif name == "user" -%}<circle cx="12" cy="8" r="4"/><path d="M4 21c.8-4.2 3.9-6.5 8-6.5s7.2 2.3 8 6.5"/>
+{%- elif name == "building" -%}<path d="M4 21V9l5-3v15M9 21V4l6 3v14M15 21V11l5 2v8M2 21h20M11.5 9h1M11.5 12h1M11.5 15h1M17 15h1"/>
+{%- elif name == "layers" -%}<path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5M3 17.5l9 5 9-5"/>
+{%- elif name == "map-pin" -%}<path d="M3 7l6-3 6 3 6-3v13l-6 3-6-3-6 3z"/><path d="M12 13.5s3-2.6 3-5a3 3 0 0 0-6 0c0 2.4 3 5 3 5z"/>
+{%- elif name == "chart" -%}<path d="M4 20V4M4 20h16"/><rect x="7" y="12" width="3" height="5" rx="1"/><rect x="12" y="8" width="3" height="9" rx="1"/><rect x="17" y="5" width="3" height="12" rx="1"/>
 {%- endif -%}
+</svg>
+{%- endmacro %}
+
+{# Faint city skyline used behind page headers, as in the CAPNOVA reference. #}
+{% macro skyline(cls="skyline") -%}
+<svg class="{{ cls }}" viewBox="0 0 520 160" aria-hidden="true" focusable="false" preserveAspectRatio="xMidYMax meet">
+  <g fill="currentColor">
+    <rect x="10" y="92" width="46" height="68" rx="2"/><rect x="62" y="58" width="38" height="102" rx="2"/>
+    <rect x="106" y="28" width="52" height="132" rx="2"/><rect x="164" y="74" width="34" height="86" rx="2"/>
+    <rect x="204" y="10" width="44" height="150" rx="2"/><rect x="254" y="48" width="56" height="112" rx="2"/>
+    <rect x="316" y="84" width="36" height="76" rx="2"/><rect x="358" y="36" width="48" height="124" rx="2"/>
+    <rect x="412" y="66" width="40" height="94" rx="2"/><rect x="458" y="100" width="52" height="60" rx="2"/>
+  </g>
 </svg>
 {%- endmacro %}
 
