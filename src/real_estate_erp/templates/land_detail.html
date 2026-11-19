@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}{{ t('plan_number') }} {{ land.plan_number }} · {{ t('land_number') }} {{ land.land_number }}{% endblock %}
+{% block heading %}{{ t('plan_number') }} <bdi dir="{{ dir }}">{{ land.plan_number }}</bdi> · {{ t('land_number') }} <bdi dir="{{ dir }}">{{ land.land_number }}</bdi>{% endblock %}
+{% block subheading %}<p class="topbar-sub"><a class="link-back" href="/lands">{{ icon('arrow', 'icon icon-sm flip-back') }}{{ t('back_to_lands') }}</a></p>{% endblock %}
+{% block content %}
+
+<div class="grid-2 grid-2-even">
+  <section class="card panel">
+    <header class="panel-head">
+      <h2>{{ t('land_summary') }}</h2>
+      <span class="badge badge-{{ land.status }}">{{ t('status_' ~ land.status) }}</span>
+    </header>
+    <dl class="facts">
+      <div><dt>{{ t('city') }}</dt><dd>{{ land.city if lang == 'ar' else land.city_name_en }}</dd></div>
+      <div><dt>{{ t('plan_number') }}</dt><dd><bdi dir="{{ dir }}">{{ land.plan_number }}</bdi></dd></div>
+      <div><dt>{{ t('land_number') }}</dt><dd><bdi dir="{{ dir }}">{{ land.land_number }}</bdi></dd></div>
+      <div><dt>{{ t('area') }}</dt><dd>{{ qty(land.area_sqm, 'sqm') }}</dd></div>
+      <div><dt>{{ t('street_width') }}</dt><dd>{{ qty(land.street_width_m, 'meters') }}</dd></div>
+      <div><dt>{{ t('purchase_recorded') }}</dt>
+          <dd>{% if land.purchase_recorded %}{{ t('recorded') }}{% else %}<span class="muted">{{ t('not_recorded') }}</span>{% endif %}</dd></div>
+    </dl>
+  </section>
+
+  <section class="card panel">
+    <header class="panel-head">
+      <h2>{{ t('acquisition_breakdown') }}</h2>
+      <span class="pill pill-read">{{ icon('lock', 'icon icon-sm') }}{{ t('read_only') }}</span>
+    </header>
+    <ul class="breakdown">
+      <li>
+        <span><strong>{{ t('purchase_price') }}</strong></span>
+        <span class="amount">{{ money(land.purchase_price) }}</span>
+      </li>
+      <li>
+        <span><strong>+ {{ t('purchase_tax') }}</strong><small>{{ t('purchase_tax_rate') }}</small></span>
+        <span class="amount">{{ money(land.purchase_tax) }}</span>
+      </li>
+      <li>
+        <span><strong>+ {{ t('dalalah') }}</strong><small>{{ t('dalalah_rate') }}</small></span>
+        <span class="amount">{{ money(land.dalalah) }}</span>
+      </li>
+      <li class="breakdown-total">
+        <span><strong>= {{ t('total_cost') }}</strong></span>
+        <span class="amount">{{ money(land.total_acquisition_cost) }}</span>
+      </li>
+    </ul>
+    <p class="fine-print">{{ icon('info', 'icon icon-sm') }}<span>{{ t('charges_on_purchase_only') }}</span></p>
+  </section>
+</div>
+{% endblock %}

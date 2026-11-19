@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}{{ t(module ~ '_title') }}{% endblock %}
+{% block heading %}{{ t(module ~ '_title') }}{% endblock %}
+{% block subheading %}<p class="topbar-sub">{{ t(module ~ '_intro') }}</p>{% endblock %}
+{% block content %}
+
+<section class="stats stats-compact">
+  {% if module == 'investors' %}
+    <article class="stat card"><span class="icon-chip">{{ icon('investors') }}</span>
+      <p class="stat-label">{{ t('active_investors') }}</p><p class="stat-value">{{ count(counts.investors) }}</p></article>
+    <article class="stat card"><span class="icon-chip">{{ icon('portfolios') }}</span>
+      <p class="stat-label">{{ t('active_portfolios') }}</p><p class="stat-value">{{ count(counts.portfolios) }}</p></article>
+  {% elif module == 'portfolios' %}
+    <article class="stat card"><span class="icon-chip">{{ icon('portfolios') }}</span>
+      <p class="stat-label">{{ t('active_portfolios') }}</p><p class="stat-value">{{ count(counts.portfolios) }}</p></article>
+    <article class="stat card"><span class="icon-chip">{{ icon('deals') }}</span>
+      <p class="stat-label">{{ t('active_deals') }}</p><p class="stat-value">{{ count(counts.deals) }}</p></article>
+  {% else %}
+    <article class="stat card"><span class="icon-chip">{{ icon('accounting') }}</span>
+      <p class="stat-label">{{ t('ledger_accounts') }}</p><p class="stat-value">{{ count(counts.ledger_accounts) }}</p></article>
+    <article class="stat card"><span class="icon-chip">{{ icon('check') }}</span>
+      <p class="stat-label">{{ t('journal_posted') }}</p><p class="stat-value">{{ count(counts.journal_posted) }}</p></article>
+    <article class="stat card"><span class="icon-chip">{{ icon('receipt') }}</span>
+      <p class="stat-label">{{ t('journal_draft') }}</p><p class="stat-value">{{ count(counts.journal_draft) }}</p></article>
+    <article class="stat card"><span class="icon-chip">{{ icon('coins') }}</span>
+      <p class="stat-label">{{ t('land_purchases') }}</p><p class="stat-value">{{ count(counts.land_purchases) }}</p></article>
+  {% endif %}
+</section>
+
+<div class="grid-2 grid-2-even">
+  <section class="card empty-state">
+    <span class="empty-art">{{ icon(module, 'icon icon-xl') }}</span>
+    <h2>{{ t('module_soon_title') }}</h2>
+    <p class="muted">{{ t('module_soon_text') }}</p>
+    <p class="empty-note">{{ t('empty_dev') }}</p>
+  </section>
+
+  <section class="card panel">
+    <header class="panel-head"><h2>{{ t('controls_title') }}</h2></header>
+    <ul class="checklist">
+      <li>{{ icon('check') }}<span>{{ t('control_four_eyes') }}</span></li>
+      <li>{{ icon('check') }}<span>{{ t('control_one_employee') }}</span></li>
+      <li>{{ icon('check') }}<span>{{ t('control_audit') }}</span></li>
+      <li>{{ icon('check') }}<span>{{ t('control_tax') }}</span></li>
+    </ul>
+  </section>
+</div>
+{% endblock %}

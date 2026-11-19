@@ -1,2 +1,7 @@
-def main() -> None:
-    print("Hello from real-estate-erp!")
+"""Real Estate ERP."""
+
+
+def main() -> int:
+    from .cli import main as cli_main
+
+    return cli_main()
