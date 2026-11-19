@@ -7,8 +7,9 @@
 -- uses the same rule functions as recorded purchases.
 --
 -- Idempotent: safe to run any number of times. A land is identified by city + plan number + land number;
--- re-running refreshes the seeded facts while the land is still prospective and never touches a land that
--- has moved on (for example, been bought).
+-- re-running refreshes the seeded facts only if they differ and the land is still prospective, and never
+-- touches a land that has moved on (for example, been bought). Rows are created by the system user and
+-- audited like any other change.
 --
 -- Usage (refuses to run without the development flag):
 --   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v seed_env=development -f db/seeds/dev_jeddah_lands.sql
@@ -29,6 +30,10 @@ SET client_encoding = 'UTF8';
 
 BEGIN;
 
+-- Seeds act as the built-in system user (data_entry rights only; it can never post or approve). This is
+-- only possible for the database owner: the application cannot call erp_act_as_system().
+SELECT erp_act_as_system() \gset
+
 INSERT INTO lands (city, plan_number, land_number, area_sqm, street_width_m, purchase_price, status)
 VALUES
   ('جدة', '99/أ', '1200', 900, 16, 1500000, 'prospective'),
@@ -38,7 +43,9 @@ ON CONFLICT ON CONSTRAINT lands_identity_uq DO UPDATE
    SET area_sqm = EXCLUDED.area_sqm,
        street_width_m = EXCLUDED.street_width_m,
        purchase_price = EXCLUDED.purchase_price
- WHERE lands.status = 'prospective';
+ WHERE lands.status = 'prospective'
+   AND (lands.area_sqm, lands.street_width_m, lands.purchase_price)
+       IS DISTINCT FROM (EXCLUDED.area_sqm, EXCLUDED.street_width_m, EXCLUDED.purchase_price);
 
 COMMIT;
 

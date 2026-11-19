@@ -42,6 +42,50 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- ---------------------------------------------------------------------------
+-- Employees (internal office staff only; investors and buyers never have accounts)
+-- One role per employee:
+--   admin       manages employees and cities; approves profit, distributions, settlements, closures
+--   accountant  prepares and posts financial records (purchases, sales, expenses, capital, payouts,
+--               distributions); cannot approve
+--   data_entry  maintains lands, investors, portfolios, deals, funding accounts and documents; drafts
+--               journal entries; cannot post or approve
+--   viewer      read only
+-- Every write must name its acting employee with erp_act_as(<id>) at the start of the transaction.
+-- Four-eyes rule: whoever prepared a financial record can never post or approve it, whatever their role.
+-- ---------------------------------------------------------------------------
+CREATE TABLE app_users (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  full_name text NOT NULL CHECK (full_name = btrim(full_name) AND full_name <> ''),
+  email text CHECK (email = lower(btrim(email)) AND email ~ '^[^@\s]+@[^@\s]+\.[^@\s]+$'),
+  role text NOT NULL CHECK (role IN ('admin','accountant','data_entry','viewer')),
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','disabled')),
+  is_system boolean NOT NULL DEFAULT false,
+  CONSTRAINT app_users_email_required CHECK (is_system OR email IS NOT NULL)
+);
+CREATE UNIQUE INDEX app_users_email_uq ON app_users (email) WHERE email IS NOT NULL;
+COMMENT ON TABLE app_users IS 'Internal office employees. Never deleted: disable instead. No customer or investor accounts.';
+COMMENT ON COLUMN app_users.is_system IS 'The single built-in system user used by seeds and maintenance; it can never log in.';
+
+-- The built-in system user: data_entry rights only (can never post or approve), cannot log in.
+CREATE FUNCTION erp_system_user_id() RETURNS uuid LANGUAGE sql IMMUTABLE AS
+$$ SELECT '00000000-0000-0000-0000-000000000001'::uuid $$;
+INSERT INTO app_users (id, full_name, email, role, is_system)
+VALUES (erp_system_user_id(), 'System', NULL, 'data_entry', true);
+
+-- Groundwork for secure login. Only a password HASH is ever stored (Argon2id, produced by the
+-- application); plain passwords never reach the database. Readable only by the erp_auth database role.
+CREATE TABLE user_credentials (
+  user_id uuid PRIMARY KEY REFERENCES app_users(id),
+  password_hash text NOT NULL CHECK (password_hash LIKE '$argon2id$%'),
+  password_changed_at timestamptz NOT NULL DEFAULT now(),
+  failed_login_count integer NOT NULL DEFAULT 0 CHECK (failed_login_count >= 0),
+  locked_until timestamptz,
+  mfa_enabled boolean NOT NULL DEFAULT false,
+  last_login_at timestamptz
+);
+COMMENT ON TABLE user_credentials IS 'Login credentials (Argon2id hash only). Not visible to the application role; audited without the hash.';
+
+-- ---------------------------------------------------------------------------
 -- Parties
 -- ---------------------------------------------------------------------------
 CREATE TABLE investors (
@@ -467,16 +511,23 @@ CREATE TABLE documents (
   uploaded_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- Append-only audit trail, written only by the erp_audit trigger on every audited table.
+-- action: create, update, delete, or the business step of a status change (post, reverse, approve,
+-- pay, cancel, void, settle, close, disable, status_change), role_change, credential_*.
 CREATE TABLE audit_events (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  actor_id uuid,
+  actor_id uuid REFERENCES app_users(id),
   entity_type text NOT NULL,
-  entity_id uuid NOT NULL,
+  entity_id text NOT NULL,
   action text NOT NULL,
   old_values jsonb,
   new_values jsonb,
-  occurred_at timestamptz NOT NULL DEFAULT now()
+  transaction_id bigint NOT NULL DEFAULT txid_current(),
+  occurred_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
+CREATE INDEX audit_events_entity_idx ON audit_events (entity_type, entity_id);
+CREATE INDEX audit_events_actor_idx ON audit_events (actor_id);
+COMMENT ON TABLE audit_events IS 'Append-only: who did what, when, with values before and after. Cannot be edited or deleted.';
 
 -- ---------------------------------------------------------------------------
 -- Indexes on foreign-key columns (PostgreSQL does not create these automatically)
@@ -669,9 +720,6 @@ CREATE TRIGGER portfolios_before_write BEFORE UPDATE ON portfolios
   FOR EACH ROW EXECUTE FUNCTION portfolios_before_write();
 
 -- ---- Lands ----------------------------------------------------------------
-CREATE FUNCTION erp_land_status_sync_active() RETURNS boolean LANGUAGE sql STABLE AS
-$$ SELECT coalesce(current_setting('erp.land_status_sync', true), '') = 'on' $$;
-
 -- Recomputes a land's sale-driven status, then its parent's, up to the original land.
 CREATE FUNCTION refresh_land_status(p_land_id uuid) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
@@ -703,9 +751,7 @@ BEGIN
   END IF;
 
   IF new_status IS DISTINCT FROM cur.status THEN
-    PERFORM set_config('erp.land_status_sync', 'on', true);
     UPDATE lands SET status = new_status WHERE id = p_land_id;
-    PERFORM set_config('erp.land_status_sync', 'off', true);
   END IF;
 
   IF cur.parent_land_id IS NOT NULL THEN
@@ -740,7 +786,9 @@ BEGIN
   IF ((TG_OP = 'INSERT' AND NEW.status IN ('sold','partially_sold'))
       OR (TG_OP = 'UPDATE' AND NEW.status IS DISTINCT FROM OLD.status
           AND (NEW.status IN ('sold','partially_sold') OR OLD.status IN ('sold','partially_sold'))))
-     AND NOT erp_land_status_sync_active() THEN
+     AND pg_trigger_depth() < 2 THEN
+    -- Only the sale triggers (refresh_land_status, at trigger depth 2) may set these; no session setting
+    -- or direct call from the application can.
     RAISE EXCEPTION 'land %: statuses sold and partially_sold are set automatically from recorded sales', NEW.id;
   END IF;
 
@@ -1114,7 +1162,6 @@ BEGIN
   -- draft -> approved: allocate expenses, then compute and freeze the figures. Locking the deal
   -- serializes approvals so an expense is never allocated twice.
   PERFORM lock_scope('deal', NEW.deal_id);
-  PERFORM set_config('erp.allocating', 'on', true);
 
   IF NEW.kind = 'sale' THEN
     SELECT * INTO s FROM deal_sales WHERE id = NEW.deal_sale_id;
@@ -1165,7 +1212,6 @@ BEGIN
     NEW.sale_proceeds := 0;
   END IF;
 
-  PERFORM set_config('erp.allocating', 'off', true);
   before_fee := NEW.sale_proceeds - acq - exp;
   NEW.acquisition_cost := acq;
   NEW.expenses := exp;
@@ -1177,10 +1223,11 @@ END $$;
 CREATE TRIGGER profit_realizations_before_write BEFORE INSERT OR UPDATE OR DELETE ON profit_realizations
   FOR EACH ROW EXECUTE FUNCTION profit_realizations_before_write();
 
--- Expense allocations are written only by realization approval.
+-- Expense allocations are written only by realization approval, i.e. from inside the profit_realizations
+-- trigger (trigger depth 2), or removed by the cascade from a draft realization. Never directly.
 CREATE FUNCTION realization_costs_before_write() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-  IF coalesce(current_setting('erp.allocating', true), '') <> 'on' THEN
+  IF pg_trigger_depth() < 2 THEN
     RAISE EXCEPTION 'expense allocations are made automatically when a profit realization is approved';
   END IF;
   IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
@@ -1638,6 +1685,652 @@ END $$;
 
 CREATE CONSTRAINT TRIGGER payouts_check_deferred AFTER INSERT ON payouts
   DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION payouts_check();
+
+-- ===========================================================================
+-- Accountability: acting employee, role permissions, four-eyes rule, who/when stamps, audit trail
+-- ===========================================================================
+
+-- ---- Who did what, and when ------------------------------------------------
+-- Columns for each business step. All are set by the database (erp_stamp); values sent by the
+-- application are ignored. journal_entries.approved_by / posted_at record who posted the entry.
+ALTER TABLE journal_entries
+  ADD CONSTRAINT journal_entries_approved_by_fk FOREIGN KEY (approved_by) REFERENCES app_users(id),
+  ADD COLUMN reversed_by uuid REFERENCES app_users(id),
+  ADD COLUMN reversed_at timestamptz;
+COMMENT ON COLUMN journal_entries.approved_by IS 'Employee who posted the entry (never its preparer). Set by the database.';
+ALTER TABLE profit_realizations
+  ADD CONSTRAINT profit_realizations_approved_by_fk FOREIGN KEY (approved_by) REFERENCES app_users(id);
+ALTER TABLE distribution_batches
+  ADD COLUMN approved_by uuid REFERENCES app_users(id),
+  ADD COLUMN paid_by uuid REFERENCES app_users(id),
+  ADD COLUMN paid_at timestamptz,
+  ADD COLUMN cancelled_by uuid REFERENCES app_users(id),
+  ADD COLUMN cancelled_at timestamptz;
+ALTER TABLE deal_sales ADD COLUMN voided_by uuid REFERENCES app_users(id), ADD COLUMN voided_at timestamptz;
+ALTER TABLE deal_costs ADD COLUMN voided_by uuid REFERENCES app_users(id), ADD COLUMN voided_at timestamptz;
+ALTER TABLE deals ADD COLUMN settled_by uuid REFERENCES app_users(id), ADD COLUMN settled_at timestamptz;
+ALTER TABLE portfolios ADD COLUMN closed_by uuid REFERENCES app_users(id), ADD COLUMN closed_at timestamptz;
+
+-- ---- Sessions and the acting employee ------------------------------------------
+-- The login service (role erp_auth) authenticates an employee and opens a session with
+-- erp_open_session(employee, token): only the SHA-256 hash of the token is stored. The application then
+-- starts every transaction with erp_act_as(token). The database verifies the token and records the
+-- employee in acting_context, bound to this connection AND this transaction, in a table the application
+-- can neither read nor write. Nothing the application sets in its own session (e.g. set_config) is used
+-- to decide who is acting, and the identity never carries over into the next transaction.
+-- ONE EMPLOYEE PER TRANSACTION: once an employee is acting, the transaction cannot switch to anyone else,
+-- even with another valid session token. Together with the four-eyes rule this means a record can only
+-- be posted or approved in a separate transaction, by a different employee, from the one that prepared it.
+CREATE TABLE user_sessions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES app_users(id),
+  token_hash bytea NOT NULL UNIQUE,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  expires_at timestamptz NOT NULL,
+  revoked_at timestamptz,
+  CONSTRAINT user_sessions_expiry CHECK (expires_at > created_at)
+);
+CREATE INDEX user_sessions_user_idx ON user_sessions (user_id);
+COMMENT ON TABLE user_sessions IS 'Login sessions. Stores only the SHA-256 hash of each session token; written by the login service.';
+
+CREATE UNLOGGED TABLE acting_context (
+  backend_pid integer PRIMARY KEY,
+  xact_id bigint NOT NULL,
+  user_id uuid NOT NULL,
+  session_id uuid,
+  set_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+COMMENT ON TABLE acting_context IS 'Verified acting employee per connection and transaction. Written only by erp_act_as; not accessible to the application.';
+
+-- Opens a session for an active employee. Called by the login service after it has verified the password.
+CREATE FUNCTION erp_open_session(p_user uuid, p_token text, p_valid_for interval DEFAULT interval '8 hours')
+RETURNS uuid LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE
+  u app_users%ROWTYPE;
+  sid uuid;
+BEGIN
+  IF p_token IS NULL OR length(p_token) < 32 THEN
+    RAISE EXCEPTION 'session tokens must be at least 32 characters of random data';
+  END IF;
+  IF p_valid_for IS NULL OR p_valid_for <= interval '0' OR p_valid_for > interval '24 hours' THEN
+    RAISE EXCEPTION 'session lifetime must be between 0 and 24 hours';
+  END IF;
+  SELECT * INTO u FROM app_users WHERE id = p_user;
+  IF NOT FOUND OR u.is_system THEN
+    RAISE EXCEPTION 'sessions can only be opened for employees (never the system user)';
+  END IF;
+  IF u.status <> 'active' THEN
+    RAISE EXCEPTION 'employee % is disabled', u.full_name;
+  END IF;
+  INSERT INTO user_sessions (user_id, token_hash, expires_at)
+  VALUES (u.id, digest(p_token, 'sha256'), now() + p_valid_for)
+  RETURNING id INTO sid;
+  RETURN sid;
+END $$;
+
+CREATE FUNCTION erp_revoke_session(p_session uuid) RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS
+$$ UPDATE user_sessions SET revoked_at = now() WHERE id = p_session AND revoked_at IS NULL $$;
+
+-- Refuses a second, different employee in the same transaction.
+CREATE FUNCTION erp_assert_no_switch(p_user uuid) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE current_actor uuid;
+BEGIN
+  SELECT user_id INTO current_actor FROM acting_context
+   WHERE backend_pid = pg_backend_pid() AND xact_id = txid_current();
+  IF current_actor IS NOT NULL AND current_actor <> p_user THEN
+    RAISE EXCEPTION 'one employee per transaction: % is already acting in this transaction; % must act in a separate transaction',
+      (SELECT full_name FROM app_users WHERE id = current_actor), (SELECT full_name FROM app_users WHERE id = p_user)
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+END $$;
+
+CREATE FUNCTION erp_act_as(p_token text) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE
+  s user_sessions%ROWTYPE;
+  u app_users%ROWTYPE;
+BEGIN
+  SELECT * INTO s FROM user_sessions WHERE token_hash = digest(coalesce(p_token, ''), 'sha256');
+  IF NOT FOUND OR s.revoked_at IS NOT NULL OR s.expires_at <= now() THEN
+    RAISE EXCEPTION 'invalid, expired or revoked session' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  SELECT * INTO u FROM app_users WHERE id = s.user_id;
+  IF u.status <> 'active' THEN
+    RAISE EXCEPTION 'acting employee % (%) is disabled', u.full_name, u.id USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  PERFORM erp_assert_no_switch(u.id);
+  INSERT INTO acting_context (backend_pid, xact_id, user_id, session_id)
+  VALUES (pg_backend_pid(), txid_current(), u.id, s.id)
+  ON CONFLICT (backend_pid) DO UPDATE
+     SET xact_id = EXCLUDED.xact_id, user_id = EXCLUDED.user_id, session_id = EXCLUDED.session_id,
+         set_at = clock_timestamp();
+END $$;
+COMMENT ON FUNCTION erp_act_as(text) IS 'Verifies a session token and names its employee for the current transaction only (one employee per transaction). Required before any write.';
+
+-- Logs out the session acting in the current transaction.
+CREATE FUNCTION erp_end_session() RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+  UPDATE user_sessions SET revoked_at = now()
+   WHERE id = (SELECT session_id FROM acting_context
+                WHERE backend_pid = pg_backend_pid() AND xact_id = txid_current())
+     AND revoked_at IS NULL;
+END $$;
+
+-- Seeds and maintenance only (database owner): act as the built-in system user, which has Data Entry
+-- rights and can never post or approve. Not callable by the application.
+CREATE FUNCTION erp_act_as_system() RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+  SELECT erp_assert_no_switch(erp_system_user_id());
+  INSERT INTO acting_context (backend_pid, xact_id, user_id, session_id)
+  VALUES (pg_backend_pid(), txid_current(), erp_system_user_id(), NULL)
+  ON CONFLICT (backend_pid) DO UPDATE
+     SET xact_id = EXCLUDED.xact_id, user_id = EXCLUDED.user_id, session_id = NULL, set_at = clock_timestamp()
+$$;
+
+-- The acting employee for this transaction, or NULL. Never reads anything the application can set.
+CREATE FUNCTION erp_acting_user_id() RETURNS uuid LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+  SELECT user_id FROM acting_context WHERE backend_pid = pg_backend_pid() AND xact_id = txid_current()
+$$;
+
+CREATE FUNCTION erp_acting_user() RETURNS app_users LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE
+  uid uuid := erp_acting_user_id();
+  u app_users%ROWTYPE;
+BEGIN
+  IF uid IS NULL THEN
+    RAISE EXCEPTION 'no acting employee: call erp_act_as(<session token>) at the start of the transaction'
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  SELECT * INTO u FROM app_users WHERE id = uid;
+  IF u.status <> 'active' THEN
+    RAISE EXCEPTION 'acting employee % (%) is disabled', u.full_name, u.id USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  RETURN u;
+END $$;
+
+CREATE FUNCTION erp_require(p_roles text[], p_action text) RETURNS app_users LANGUAGE plpgsql STABLE AS $$
+DECLARE u app_users%ROWTYPE := erp_acting_user();
+BEGIN
+  IF NOT (u.role = ANY (p_roles)) THEN
+    RAISE EXCEPTION 'permission denied: % requires role %; % is %',
+      p_action, array_to_string(p_roles, ' or '), u.full_name, u.role USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  RETURN u;
+END $$;
+
+-- Four-eyes rule: no exceptions for any role. The record simply stays pending until another
+-- authorized employee acts.
+CREATE FUNCTION erp_four_eyes(p_user app_users, p_preparers uuid[], p_action text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  IF p_user.id = ANY (p_preparers) THEN
+    RAISE EXCEPTION 'four-eyes rule: % prepared this record and cannot % it; it stays pending until another authorized employee does',
+      p_user.full_name, p_action USING ERRCODE = 'insufficient_privilege';
+  END IF;
+END $$;
+
+-- First admin, for a new installation only (run by the database owner; not callable by the application).
+-- Runs with the owner's privileges; the permission check accepts it only for the owner and only while no
+-- admin exists. No session setting is involved.
+CREATE FUNCTION erp_bootstrap_admin(p_full_name text, p_email text, p_id uuid DEFAULT gen_random_uuid())
+RETURNS uuid LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM app_users WHERE role = 'admin' AND NOT is_system) THEN
+    RAISE EXCEPTION 'an admin already exists; admins create further employees';
+  END IF;
+  PERFORM erp_act_as_system();
+  INSERT INTO app_users (id, full_name, email, role) VALUES (p_id, p_full_name, p_email, 'admin');
+  RETURN p_id;
+END $$;
+
+-- True only when running with the privileges of the schema owner (inside an owner-run function or an
+-- owner session), never for the application roles.
+CREATE FUNCTION erp_running_as_owner() RETURNS boolean LANGUAGE sql STABLE AS $$
+  SELECT (SELECT relowner FROM pg_class WHERE oid = 'app_users'::regclass)
+         = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+$$;
+
+-- ---- Soft deletion of master data ---------------------------------------------------
+-- These tables are never deleted from; records are deactivated (is_active = false) and inactive records
+-- cannot be used for new activity. History, accounting and audit references stay intact.
+CREATE FUNCTION erp_soft_delete_tables() RETURNS text[] LANGUAGE sql IMMUTABLE AS $$
+  SELECT ARRAY['investors','portfolios','lands','deals','funding_accounts','ledger_accounts','documents',
+               'cities','city_aliases']
+$$;
+
+CREATE FUNCTION erp_assert_active(p_table regclass, p_id anyelement, p_what text) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE v_active boolean;
+BEGIN
+  IF p_id IS NULL THEN RETURN; END IF;
+  EXECUTE format('SELECT is_active FROM %s WHERE %I = $1', p_table,
+                 CASE WHEN p_table = 'city_aliases'::regclass THEN 'alias' ELSE 'id' END)
+    INTO v_active USING p_id;
+  IF v_active IS FALSE THEN
+    RAISE EXCEPTION '% % is inactive and cannot be used for new records', p_what, p_id;
+  END IF;
+END $$;
+
+-- ---- Permissions (checked before every other rule; fails closed for unknown tables) ----
+CREATE FUNCTION erp_authorize() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+  u app_users%ROWTYPE;
+  editors   CONSTANT text[] := ARRAY['admin','accountant','data_entry'];
+  finance   CONSTANT text[] := ARRAY['admin','accountant'];
+  admins    CONSTANT text[] := ARRAY['admin'];
+  preparers uuid[];
+  step text;
+BEGIN
+  IF TG_OP = 'DELETE' AND TG_TABLE_NAME = ANY (erp_soft_delete_tables()) THEN
+    RAISE EXCEPTION '% records are never deleted; deactivate them instead (set is_active = false)', TG_TABLE_NAME;
+  END IF;
+
+  CASE TG_TABLE_NAME
+  WHEN 'realization_costs' THEN
+    NULL;                                        -- written only by an approval, which is itself authorized
+  WHEN 'app_users' THEN
+    IF TG_OP = 'INSERT' AND NEW.role = 'admin' AND NOT NEW.is_system AND erp_running_as_owner()
+       AND NOT EXISTS (SELECT 1 FROM app_users WHERE role = 'admin' AND NOT is_system) THEN
+      RETURN NEW;                                -- first admin of a new installation (erp_bootstrap_admin)
+    END IF;
+    u := erp_require(admins, 'managing employees');
+    IF TG_OP = 'DELETE' THEN
+      RAISE EXCEPTION 'employees cannot be deleted; disable them instead';
+    ELSIF TG_OP = 'INSERT' THEN
+      IF NEW.is_system THEN
+        RAISE EXCEPTION 'system users cannot be created';
+      END IF;
+    ELSE
+      IF OLD.is_system OR NEW.is_system THEN
+        RAISE EXCEPTION 'the system user cannot be changed';
+      END IF;
+      IF OLD.id = u.id AND (NEW.role, NEW.status) IS DISTINCT FROM (OLD.role, OLD.status) THEN
+        RAISE EXCEPTION 'employees cannot change their own role or status';
+      END IF;
+    END IF;
+  WHEN 'user_credentials' THEN
+    u := erp_acting_user();
+    IF TG_OP = 'DELETE' THEN
+      IF u.role <> 'admin' THEN
+        PERFORM erp_require(admins, 'removing login credentials');
+      END IF;
+    ELSE
+      IF EXISTS (SELECT 1 FROM app_users WHERE id = NEW.user_id AND is_system) THEN
+        RAISE EXCEPTION 'the system user can never have login credentials';
+      END IF;
+      IF NEW.user_id <> u.id AND u.role <> 'admin' THEN
+        PERFORM erp_require(admins, 'setting another employee''s credentials');
+      END IF;
+    END IF;
+  WHEN 'cities', 'city_aliases' THEN
+    u := erp_require(admins, 'managing cities');
+  WHEN 'investors', 'lands', 'funding_accounts', 'documents', 'journal_lines' THEN
+    u := erp_require(editors, 'editing ' || TG_TABLE_NAME);
+  WHEN 'portfolios' THEN
+    IF TG_OP = 'UPDATE' THEN
+      IF NEW.status = 'closed' AND OLD.status <> 'closed' THEN
+        u := erp_require(admins, 'closing a portfolio');
+        PERFORM erp_four_eyes(u, ARRAY[OLD.created_by], 'close');
+        RETURN NEW;
+      END IF;
+    END IF;
+    u := erp_require(editors, 'editing portfolios');
+  WHEN 'deals' THEN
+    IF TG_OP = 'UPDATE' THEN
+      IF NEW.status = 'settled' AND OLD.status <> 'settled' THEN
+        u := erp_require(admins, 'settling a deal');
+        PERFORM erp_four_eyes(u, ARRAY[OLD.created_by], 'settle');
+        RETURN NEW;
+      END IF;
+    END IF;
+    u := erp_require(editors, 'editing deals');
+  WHEN 'ledger_accounts', 'capital_movements', 'land_purchases', 'deal_costs', 'deal_sales', 'payouts',
+       'distribution_lines' THEN
+    u := erp_require(finance, 'recording ' || TG_TABLE_NAME);
+  WHEN 'journal_entries' THEN
+    IF TG_OP = 'INSERT' THEN
+      IF NEW.status <> 'draft' THEN
+        RAISE EXCEPTION 'journal entries must be created as draft and posted by a second employee';
+      END IF;
+      u := erp_require(editors, 'drafting journal entries');
+    ELSIF TG_OP = 'UPDATE' AND OLD.status = 'draft' AND NEW.status = 'posted' THEN
+      u := erp_require(finance, 'posting a journal entry');
+      preparers := ARRAY[OLD.created_by]
+                   || ARRAY(SELECT created_by FROM journal_lines WHERE journal_entry_id = OLD.id);
+      PERFORM erp_four_eyes(u, preparers, 'post');
+    ELSIF TG_OP = 'UPDATE' AND NEW.status = 'reversed' AND OLD.status <> 'reversed' THEN
+      u := erp_require(finance, 'reversing a journal entry');
+    ELSE
+      u := erp_require(editors, 'editing draft journal entries');
+    END IF;
+  WHEN 'profit_realizations' THEN
+    IF TG_OP = 'UPDATE' THEN
+      IF NEW.status = 'approved' AND OLD.status <> 'approved' THEN
+        u := erp_require(admins, 'approving a profit realization');
+        PERFORM erp_four_eyes(u, ARRAY[OLD.created_by], 'approve');
+        RETURN NEW;
+      END IF;
+    END IF;
+    u := erp_require(finance, 'preparing profit realizations');
+  WHEN 'distribution_batches' THEN
+    IF TG_OP = 'UPDATE' THEN
+      IF NEW.status IS DISTINCT FROM OLD.status AND NEW.status IN ('approved','paid','cancelled') THEN
+        step := CASE NEW.status WHEN 'approved' THEN 'approve' WHEN 'paid' THEN 'mark as paid' ELSE 'cancel' END;
+        u := erp_require(admins, step || ' a distribution');
+        preparers := ARRAY[OLD.created_by]
+                     || ARRAY(SELECT created_by FROM distribution_lines WHERE batch_id = OLD.id);
+        PERFORM erp_four_eyes(u, preparers, step);
+        RETURN NEW;
+      END IF;
+    END IF;
+    u := erp_require(finance, 'preparing distributions');
+  ELSE
+    RAISE EXCEPTION 'no permission rule defined for table %', TG_TABLE_NAME;
+  END CASE;
+
+  -- Inactive (soft-deleted) master data cannot be used for new records.
+  IF TG_OP = 'INSERT' OR (TG_OP = 'UPDATE' AND TG_TABLE_NAME = 'journal_lines') THEN
+    CASE TG_TABLE_NAME
+    WHEN 'funding_accounts' THEN
+      PERFORM erp_assert_active('investors'::regclass, NEW.investor_id, 'investor');
+      PERFORM erp_assert_active('portfolios'::regclass, NEW.portfolio_id, 'portfolio');
+      PERFORM erp_assert_active('portfolios'::regclass, NEW.parent_portfolio_id, 'portfolio');
+      PERFORM erp_assert_active('deals'::regclass, NEW.deal_id, 'deal');
+    WHEN 'deals' THEN
+      PERFORM erp_assert_active('lands'::regclass, NEW.land_id, 'land');
+    WHEN 'lands' THEN
+      PERFORM erp_assert_active('lands'::regclass, NEW.parent_land_id, 'parent land');
+    WHEN 'journal_lines' THEN
+      PERFORM erp_assert_active('ledger_accounts'::regclass, NEW.ledger_account_id, 'ledger account');
+    WHEN 'capital_movements' THEN
+      PERFORM erp_assert_active('funding_accounts'::regclass, NEW.funding_account_id, 'funding account');
+    WHEN 'deal_sales', 'land_purchases', 'deal_costs' THEN
+      PERFORM erp_assert_active('lands'::regclass, NEW.land_id, 'land');
+    ELSE
+      NULL;
+    END CASE;
+  END IF;
+
+  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+  RETURN NEW;
+END $$;
+
+-- ---- Who/when stamps --------------------------------------------------------
+CREATE FUNCTION erp_stamp() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+  uid uuid := (erp_acting_user()).id;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    NEW.created_by := uid;  NEW.created_at := now();
+    NEW.updated_by := NULL; NEW.updated_at := NULL;
+  ELSE
+    NEW.created_by := OLD.created_by; NEW.created_at := OLD.created_at;
+    NEW.updated_by := uid;            NEW.updated_at := now();
+  END IF;
+
+  CASE TG_TABLE_NAME
+  WHEN 'journal_entries' THEN
+    IF TG_OP = 'INSERT' THEN
+      NEW.approved_by := NULL; NEW.posted_at := NULL; NEW.reversed_by := NULL; NEW.reversed_at := NULL;
+    ELSIF OLD.status = 'draft' AND NEW.status = 'posted' THEN
+      NEW.approved_by := uid; NEW.posted_at := now();
+    ELSIF OLD.status = 'draft' THEN
+      NEW.approved_by := NULL; NEW.posted_at := NULL;
+    ELSE
+      NEW.approved_by := OLD.approved_by; NEW.posted_at := OLD.posted_at;
+      IF OLD.status = 'posted' AND NEW.status = 'reversed' THEN
+        NEW.reversed_by := uid; NEW.reversed_at := now();
+      ELSE
+        NEW.reversed_by := OLD.reversed_by; NEW.reversed_at := OLD.reversed_at;
+      END IF;
+    END IF;
+  WHEN 'profit_realizations' THEN
+    IF TG_OP = 'INSERT' THEN
+      NEW.approved_by := NULL; NEW.approved_at := NULL;
+    ELSIF OLD.status = 'draft' AND NEW.status = 'approved' THEN
+      NEW.approved_by := uid; NEW.approved_at := now();
+    ELSE
+      NEW.approved_by := OLD.approved_by; NEW.approved_at := OLD.approved_at;
+    END IF;
+  WHEN 'distribution_batches' THEN
+    IF TG_OP = 'INSERT' THEN
+      NEW.approved_by := NULL; NEW.approved_at := NULL; NEW.paid_by := NULL; NEW.paid_at := NULL;
+      NEW.cancelled_by := NULL; NEW.cancelled_at := NULL;
+    ELSE
+      IF OLD.status = 'draft' AND NEW.status = 'approved' THEN
+        NEW.approved_by := uid; NEW.approved_at := now();
+      ELSIF OLD.status <> 'draft' THEN
+        NEW.approved_by := OLD.approved_by; NEW.approved_at := OLD.approved_at;
+      END IF;
+      IF NEW.status = 'paid' AND OLD.status <> 'paid' THEN
+        NEW.paid_by := uid; NEW.paid_at := now();
+      ELSE
+        NEW.paid_by := OLD.paid_by; NEW.paid_at := OLD.paid_at;
+      END IF;
+      IF NEW.status = 'cancelled' AND OLD.status <> 'cancelled' THEN
+        NEW.cancelled_by := uid; NEW.cancelled_at := now();
+      ELSE
+        NEW.cancelled_by := OLD.cancelled_by; NEW.cancelled_at := OLD.cancelled_at;
+      END IF;
+    END IF;
+  WHEN 'deal_sales', 'deal_costs' THEN
+    IF TG_OP = 'INSERT' THEN
+      NEW.voided_by := NULL; NEW.voided_at := NULL;
+    ELSIF NEW.status = 'voided' AND OLD.status <> 'voided' THEN
+      NEW.voided_by := uid; NEW.voided_at := now();
+    ELSE
+      NEW.voided_by := OLD.voided_by; NEW.voided_at := OLD.voided_at;
+    END IF;
+  WHEN 'deals' THEN
+    IF TG_OP = 'INSERT' THEN
+      NEW.settled_by := NULL; NEW.settled_at := NULL;
+    ELSIF NEW.status = 'settled' AND OLD.status <> 'settled' THEN
+      NEW.settled_by := uid; NEW.settled_at := now();
+    ELSE
+      NEW.settled_by := OLD.settled_by; NEW.settled_at := OLD.settled_at;
+    END IF;
+  WHEN 'portfolios' THEN
+    IF TG_OP = 'INSERT' THEN
+      NEW.closed_by := NULL; NEW.closed_at := NULL;
+    ELSIF NEW.status = 'closed' AND OLD.status <> 'closed' THEN
+      NEW.closed_by := uid; NEW.closed_at := now();
+    ELSE
+      NEW.closed_by := OLD.closed_by; NEW.closed_at := OLD.closed_at;
+    END IF;
+  ELSE
+    NULL;
+  END CASE;
+
+  IF TG_TABLE_NAME = ANY (erp_soft_delete_tables()) THEN
+    IF TG_OP = 'INSERT' THEN
+      NEW.deactivated_by := CASE WHEN NEW.is_active THEN NULL ELSE uid END;
+      NEW.deactivated_at := CASE WHEN NEW.is_active THEN NULL ELSE now() END;
+    ELSIF OLD.is_active AND NOT NEW.is_active THEN
+      NEW.deactivated_by := uid; NEW.deactivated_at := now();
+    ELSIF NEW.is_active THEN
+      NEW.deactivated_by := NULL; NEW.deactivated_at := NULL;
+    ELSE
+      NEW.deactivated_by := OLD.deactivated_by; NEW.deactivated_at := OLD.deactivated_at;
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+
+-- ---- Audit trail -------------------------------------------------------------
+-- SECURITY DEFINER so the application role, which cannot write audit_events itself, still gets every
+-- change recorded.
+CREATE FUNCTION erp_audit() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE
+  o jsonb;
+  n jsonb;
+  r jsonb;
+  act text;
+BEGIN
+  IF TG_OP <> 'INSERT' THEN o := to_jsonb(OLD); END IF;
+  IF TG_OP <> 'DELETE' THEN n := to_jsonb(NEW); END IF;
+  IF TG_TABLE_NAME = 'user_credentials' THEN
+    o := o - 'password_hash';
+    n := n - 'password_hash';
+  ELSIF TG_TABLE_NAME = 'user_sessions' THEN
+    o := o - 'token_hash';
+    n := n - 'token_hash';
+  END IF;
+  r := coalesce(n, o);
+
+  act := CASE TG_OP WHEN 'INSERT' THEN 'create' WHEN 'DELETE' THEN 'delete' ELSE 'update' END;
+  IF TG_OP = 'UPDATE' AND (o->>'status') IS DISTINCT FROM (n->>'status') THEN
+    act := CASE n->>'status'
+             WHEN 'posted' THEN 'post'     WHEN 'reversed' THEN 'reverse' WHEN 'approved' THEN 'approve'
+             WHEN 'paid' THEN 'pay'        WHEN 'cancelled' THEN 'cancel' WHEN 'voided' THEN 'void'
+             WHEN 'settled' THEN 'settle'  WHEN 'closed' THEN 'close'     WHEN 'disabled' THEN 'disable'
+             ELSE 'status_change' END;
+  END IF;
+  IF TG_TABLE_NAME = 'app_users' AND TG_OP = 'UPDATE' AND (o->>'role') IS DISTINCT FROM (n->>'role') THEN
+    act := 'role_change';
+  END IF;
+  IF TG_OP = 'UPDATE' AND (o->>'is_active') IS DISTINCT FROM (n->>'is_active') THEN
+    act := CASE WHEN (n->>'is_active')::boolean THEN 'reactivate' ELSE 'deactivate' END;
+  END IF;
+  IF TG_TABLE_NAME = 'user_credentials' THEN
+    act := 'credential_' || act;
+  ELSIF TG_TABLE_NAME = 'user_sessions' THEN
+    act := CASE WHEN TG_OP = 'INSERT' THEN 'session_open'
+                WHEN (o->>'revoked_at') IS NULL AND (n->>'revoked_at') IS NOT NULL THEN 'session_revoke'
+                ELSE 'session_' || act END;
+  END IF;
+
+  INSERT INTO audit_events (actor_id, entity_type, entity_id, action, old_values, new_values)
+  VALUES (CASE WHEN TG_TABLE_NAME = 'user_sessions' THEN coalesce(erp_acting_user_id(), (r->>'user_id')::uuid)
+               ELSE erp_acting_user_id() END,
+          TG_TABLE_NAME,
+          coalesce(r->>'id', r->>'user_id', r->>'alias', (r->>'realization_id') || ':' || (r->>'deal_cost_id')),
+          act, o, n);
+  RETURN NULL;
+END $$;
+
+CREATE FUNCTION audit_events_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'audit_events is append-only: audit records can never be changed or deleted';
+END $$;
+CREATE TRIGGER audit_events_append_only BEFORE UPDATE OR DELETE ON audit_events
+  FOR EACH ROW EXECUTE FUNCTION audit_events_append_only();
+CREATE TRIGGER audit_events_no_truncate BEFORE TRUNCATE ON audit_events
+  FOR EACH STATEMENT EXECUTE FUNCTION audit_events_append_only();
+
+-- ---- Protect every table, now and in the future -------------------------------------------
+-- erp_protect_table adds created_by/created_at/updated_by/updated_at and attaches the permission, stamp
+-- and audit triggers. Trigger names sort first (aa_, ab_) so permissions and stamps apply before every
+-- other rule; zz_audit runs last. Every new table in schema public is protected automatically by the
+-- event trigger below, and is unwritable until a permission rule is added to erp_authorize (fails closed).
+CREATE FUNCTION erp_protect_table(p_table regclass) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE format('ALTER TABLE %s ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now()', p_table);
+  EXECUTE format('ALTER TABLE %s ADD COLUMN IF NOT EXISTS created_by uuid NOT NULL DEFAULT %L REFERENCES app_users(id)',
+                 p_table, erp_system_user_id());
+  EXECUTE format('ALTER TABLE %s ALTER COLUMN created_by DROP DEFAULT', p_table);
+  EXECUTE format('ALTER TABLE %s ADD COLUMN IF NOT EXISTS updated_by uuid REFERENCES app_users(id), '
+                 'ADD COLUMN IF NOT EXISTS updated_at timestamptz', p_table);
+  EXECUTE format('CREATE OR REPLACE TRIGGER aa_authorize BEFORE INSERT OR UPDATE OR DELETE ON %s '
+                 'FOR EACH ROW EXECUTE FUNCTION erp_authorize()', p_table);
+  EXECUTE format('CREATE OR REPLACE TRIGGER ab_stamp BEFORE INSERT OR UPDATE ON %s '
+                 'FOR EACH ROW EXECUTE FUNCTION erp_stamp()', p_table);
+  EXECUTE format('CREATE OR REPLACE TRIGGER zz_audit AFTER INSERT OR UPDATE OR DELETE ON %s '
+                 'FOR EACH ROW EXECUTE FUNCTION erp_audit()', p_table);
+  EXECUTE format('REVOKE ALL ON %s FROM PUBLIC', p_table);
+END $$;
+
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY erp_soft_delete_tables() LOOP
+    EXECUTE format('ALTER TABLE %I ADD COLUMN is_active boolean NOT NULL DEFAULT true, '
+                   'ADD COLUMN deactivated_by uuid REFERENCES app_users(id), ADD COLUMN deactivated_at timestamptz', t);
+  END LOOP;
+  FOREACH t IN ARRAY ARRAY[
+    'app_users','user_credentials','cities','city_aliases',
+    'investors','portfolios','lands','deals','funding_accounts','ledger_accounts',
+    'journal_entries','journal_lines','capital_movements','land_purchases','deal_costs','deal_sales',
+    'profit_realizations','realization_costs','distribution_batches','distribution_lines','payouts','documents']
+  LOOP
+    PERFORM erp_protect_table(t::regclass);
+  END LOOP;
+END $$;
+
+-- Sessions are opened before anyone is acting, so they get the audit trigger only.
+CREATE TRIGGER zz_audit AFTER INSERT OR UPDATE OR DELETE ON user_sessions FOR EACH ROW EXECUTE FUNCTION erp_audit();
+
+-- Tables that are deliberately not protected by erp_protect_table (checked by the test suite).
+CREATE FUNCTION erp_unprotected_tables() RETURNS SETOF text LANGUAGE sql STABLE AS $$
+  SELECT c.relname::text FROM pg_class c
+   WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r','p')
+     AND c.relname NOT IN ('audit_events','acting_context','user_sessions')
+     AND NOT (EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgrelid = c.oid AND t.tgname = 'aa_authorize')
+              AND EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgrelid = c.oid AND t.tgname = 'ab_stamp')
+              AND EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgrelid = c.oid AND t.tgname = 'zz_audit'))
+$$;
+
+CREATE FUNCTION erp_protect_new_tables() RETURNS event_trigger LANGUAGE plpgsql AS $$
+DECLARE obj record;
+BEGIN
+  FOR obj IN SELECT * FROM pg_event_trigger_ddl_commands()
+              WHERE object_type = 'table' AND schema_name = 'public'
+                AND command_tag IN ('CREATE TABLE', 'CREATE TABLE AS', 'SELECT INTO')
+  LOOP
+    PERFORM erp_protect_table(obj.objid::regclass);
+  END LOOP;
+END $$;
+
+-- Event triggers need superuser rights to install. Without them the schema still installs, with a
+-- warning; erp_unprotected_tables() then shows any later table that was not protected by hand.
+DO $$
+BEGIN
+  IF (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
+    CREATE EVENT TRIGGER erp_protect_new_tables ON ddl_command_end
+      WHEN TAG IN ('CREATE TABLE', 'CREATE TABLE AS', 'SELECT INTO')
+      EXECUTE FUNCTION erp_protect_new_tables();
+  ELSE
+    RAISE WARNING 'erp_protect_new_tables event trigger NOT installed (needs superuser): protect new tables with erp_protect_table()';
+  END IF;
+END $$;
+
+-- ---- Database roles and privileges ----------------------------------------------
+-- Group roles (NOLOGIN); real logins are created per environment and granted one of these:
+--   erp_app       the application: reads everything except credentials, writes business tables; cannot
+--                 change the schema, disable triggers or write the audit trail directly
+--   erp_auth      the login service: reads employees, reads and writes credentials
+--   erp_readonly  reporting: read only, no credentials
+-- The schema itself should be installed and owned by a separate owner role used only for migrations.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'erp_app') THEN CREATE ROLE erp_app NOLOGIN; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'erp_auth') THEN CREATE ROLE erp_auth NOLOGIN; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'erp_readonly') THEN CREATE ROLE erp_readonly NOLOGIN; END IF;
+END $$;
+
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO erp_app, erp_auth, erp_readonly;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO erp_app, erp_readonly;
+REVOKE ALL ON user_credentials, user_sessions, acting_context FROM erp_app, erp_readonly;
+GRANT INSERT, UPDATE, DELETE ON
+  app_users, cities, city_aliases, investors, portfolios, lands, deals, funding_accounts, ledger_accounts,
+  journal_entries, journal_lines, capital_movements, land_purchases, deal_costs, deal_sales,
+  profit_realizations, realization_costs, distribution_batches, distribution_lines, payouts, documents
+  TO erp_app;
+GRANT SELECT ON app_users TO erp_auth;
+GRANT SELECT, INSERT, UPDATE, DELETE ON user_credentials TO erp_auth;
+GRANT SELECT ON user_sessions TO erp_auth;
+
+-- Owner-only functions (seeds, installation, maintenance) and login-service functions.
+REVOKE EXECUTE ON FUNCTION erp_bootstrap_admin(text, text, uuid) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION erp_act_as_system() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION erp_assert_no_switch(uuid) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION erp_protect_table(regclass) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION erp_open_session(uuid, text, interval) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION erp_revoke_session(uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION erp_open_session(uuid, text, interval) TO erp_auth;
+GRANT EXECUTE ON FUNCTION erp_revoke_session(uuid) TO erp_auth;
+
+-- Future tables and functions created by the schema owner are closed to everyone until explicitly
+-- granted. (Function EXECUTE must be revoked database-wide: PostgreSQL ignores per-schema revokes of
+-- its built-in PUBLIC default.)
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 
 -- Left to the application:
 --   computing each line's amounts (the database verifies them against the rules above);

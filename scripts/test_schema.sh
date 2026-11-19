@@ -32,10 +32,10 @@ psql_run -c 'CREATE DATABASE seed_test'
 psql_run -d seed_test < real_estate_erp_schema.sql
 echo "-- seed run without the development flag (expected: refusal, nothing inserted)"
 psql_run -d seed_test < "$SEED"
-psql_run -d seed_test -c 'CREATE TABLE seed_guard_check AS SELECT count(*) AS lands_after_refused_run FROM lands'
+psql_run -d seed_test -c 'CREATE SCHEMA tests' -c 'CREATE TABLE tests.seed_guard_check AS SELECT count(*) AS lands_after_refused_run FROM lands'
 echo "-- seed run 1 (development)"
 psql_run -d seed_test -v seed_env=development < "$SEED" >/dev/null
-psql_run -d seed_test -c 'CREATE TABLE seed_snapshot AS SELECT * FROM lands'
+psql_run -d seed_test -c 'CREATE TABLE tests.seed_snapshot AS SELECT * FROM lands'
 echo "-- seed run 2 (development, must change nothing)"
 psql_run -d seed_test -v seed_env=development < "$SEED"
 psql_run -d seed_test < tests/sql/seed_test.sql

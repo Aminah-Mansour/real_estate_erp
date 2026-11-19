@@ -105,6 +105,99 @@ Keep the internal name `dalalah` in the database and code; use the labels above 
   entry and voiding the record.
 - Posted journal entries balance and can only be corrected by an exact reversal.
 
+## Employees, permissions and audit
+
+### Employees and roles
+Only internal office employees have accounts (`app_users`); investors and buyers never do. Each employee
+has one role:
+
+| Action | Admin | Accountant | Data Entry | Viewer |
+|---|:-:|:-:|:-:|:-:|
+| View data (never credentials) | ✓ | ✓ | ✓ | ✓ |
+| Manage employees and cities | ✓ | | | |
+| Investors, portfolios, lands, parcels, deals, funding accounts, documents | ✓ | ✓ | ✓ | |
+| Draft journal entries | ✓ | ✓ | ✓ | |
+| Ledger accounts | ✓ | ✓ | | |
+| Post journal entries; record purchases, sales, expenses, capital movements, payouts | ✓ | ✓ | | |
+| Reverse entries; void sales and expenses | ✓ | ✓ | | |
+| Prepare profit realizations and distributions | ✓ | ✓ | | |
+| **Approve profit realizations and distributions; mark paid or cancelled** | ✓ | | | |
+| **Settle deals; close portfolios** | ✓ | | | |
+
+Employees are never deleted (disable them), nobody can change their own role or status, and the built-in
+**system** user (used by seeds) has Data Entry rights only and can never log in.
+
+### Four-eyes rule
+Whoever prepares a financial record can never post or approve it, **whatever their role, admins included**:
+a journal entry can't be posted by its preparer or anyone who added a line; a profit realization can't be
+approved by its preparer; a distribution can't be approved, paid or cancelled by its preparer or anyone who
+added a line; a deal can't be settled, or a portfolio closed, by whoever created it. If no eligible second
+employee exists, the record simply stays pending.
+
+Because a transaction can act as only **one** employee (see below), preparing a record and posting or
+approving it always happen in **separate transactions by different employees**: a single transaction can
+never do both, even if the application holds both employees' valid session tokens.
+
+### Sessions and the acting employee
+1. The login service (database role `erp_auth`) verifies the employee's password, generates a long random
+   token and opens a session: `SELECT erp_open_session('<employee id>', '<token>');`. Only the token's
+   SHA-256 hash is stored; sessions expire (default 8 hours, at most 24) and can be revoked.
+2. The application starts **every** transaction with the employee's token:
+
+```sql
+SELECT erp_act_as('<session token>');
+```
+
+The database verifies the token and records the employee for **that transaction only**, in a table the
+application cannot read or write. Nothing the application sets in its own session (such as `set_config`) is
+used to decide who is acting, and the identity never carries over to the next transaction on a pooled
+connection. **One employee per transaction:** once an employee is acting, switching to anyone else in the
+same transaction is refused, even with that employee's valid token (naming the same employee again is
+fine). `erp_end_session()` logs the current session out.
+
+Any write without a verified acting employee is rejected, as are expired, revoked or forged tokens and
+disabled employees. The database stamps who and when on every record
+(`created_by/at`, `updated_by/at`, and `posted`, `reversed`, `approved`, `paid`, `cancelled`, `voided`,
+`settled`, `closed` by/at); values sent by the application for these columns are ignored.
+
+### Soft deletion
+Investors, lands, portfolios, deals, funding accounts, ledger accounts, documents and cities are **never
+deleted**: set `is_active = false` instead. Deactivation records who and when (`deactivated_by/at`), is
+audited (`deactivate` / `reactivate`), and inactive records cannot be used for anything new (a new deal on an
+inactive land, a new member of an inactive portfolio, a journal line on an inactive ledger account, …).
+Unfinished drafts (draft journal entries and lines, draft realizations and distributions) can still be
+deleted; posted and approved records are permanent.
+
+### Tables added in the future
+Every table in schema `public` is protected by the permission, stamp and audit triggers. A table created
+later gets them automatically (event trigger `erp_protect_new_tables`) and is unusable by the application
+until it is granted and has a permission rule in `erp_authorize`. New tables and functions are closed to
+the application roles by default. `SELECT * FROM erp_unprotected_tables();` must always return nothing (the
+test suite checks it). Installing the event trigger needs a superuser; without one the schema installs
+with a warning and new tables must be protected with `erp_protect_table()`.
+
+### Audit trail
+Every insert, update and delete on employee, master-data and financial tables is written to
+`audit_events`: employee, time, transaction id, action (`create`, `post`, `reverse`, `approve`, `pay`,
+`cancel`, `void`, `settle`, `close`, `role_change`, `credential_*`, …) and the values before and after.
+Password hashes are never logged. Audit records can never be changed, deleted or truncated.
+
+### Database roles
+| Role | Use |
+|---|---|
+| `erp_app` | The application. Reads everything except credentials; writes business tables. Cannot change the schema, disable triggers, write the audit trail directly, or create the first admin. |
+| `erp_auth` | The future login service. Reads employees; reads and writes `user_credentials`. |
+| `erp_readonly` | Reporting. Read only, no credentials. |
+
+These are group roles (no login); create one login per environment and grant it the right role. Install
+and own the schema with a separate owner role used only for migrations. On a new installation, the owner
+creates the first admin once with `SELECT erp_bootstrap_admin('<name>', '<email>');`. Seeds and maintenance
+scripts run as the owner and act as the built-in system user with `erp_act_as_system()`; the application
+can call neither.
+
+`user_credentials` stores only an **Argon2id hash** produced by the application, never a plain password,
+plus lockout and MFA fields for the future login service.
+
 ## Development seed data
 
 `db/seeds/` holds sample data for **local development only**. It is never loaded by the schema or by
@@ -140,4 +233,8 @@ This loads the schema into a throwaway PostgreSQL 16 container, runs `tests/sql/
 tests the development seed in a separate empty database (`tests/sql/seed_test.sql`: refused without the
 flag, run twice with it). It prints a PASS/FAIL line per test (rejections show the database's error
 message) and exits non-zero on any failure.
+
+The tests run as the restricted application role and follow the same rules as the application: each test
+transaction acts as exactly one employee, and journal entries a test needs posted are drafted by a second
+employee in a separate, committed database session (via the `dblink` extension, test database only).
 Use `POSTGRES_IMAGE` to test against another PostgreSQL version (15+).

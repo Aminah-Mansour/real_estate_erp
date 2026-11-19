@@ -4,8 +4,9 @@
 SET client_min_messages = warning;
 \o /dev/null
 
-CREATE TABLE t_results (n serial PRIMARY KEY, name text NOT NULL, ok boolean NOT NULL, detail text);
-CREATE FUNCTION t_true(p_name text, p_expr text) RETURNS void LANGUAGE plpgsql AS $$
+SET search_path = public, tests;
+CREATE TABLE tests.t_results (n serial PRIMARY KEY, name text NOT NULL, ok boolean NOT NULL, detail text);
+CREATE FUNCTION tests.t_true(p_name text, p_expr text) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE b boolean;
 BEGIN
   EXECUTE 'SELECT (' || p_expr || ')' INTO b;
@@ -18,18 +19,18 @@ CREATE TEMP VIEW seeded AS
 SELECT * FROM lands WHERE city = U&'\062C\062F\0629';
 
 SELECT t_true('guard: running the seed without -v seed_env=development inserts nothing',
-  $$(SELECT lands_after_refused_run FROM seed_guard_check) = 0$$);
+  $$(SELECT lands_after_refused_run FROM tests.seed_guard_check) = 0$$);
 SELECT t_true('idempotent: two development runs leave exactly 3 lands (no duplicates)',
   $$(SELECT count(*) FROM lands) = 3 AND (SELECT count(*) FROM seeded) = 3$$);
 SELECT t_true('idempotent: the second run changed nothing (same ids, values and created_at)',
   $$NOT EXISTS (
-      (SELECT id, city, plan_number, land_number, area_sqm, street_width_m, purchase_price, status, created_at FROM seed_snapshot
+      (SELECT id, city, plan_number, land_number, area_sqm, street_width_m, purchase_price, status, created_at FROM tests.seed_snapshot
        EXCEPT
        SELECT id, city, plan_number, land_number, area_sqm, street_width_m, purchase_price, status, created_at FROM lands)
       UNION ALL
       (SELECT id, city, plan_number, land_number, area_sqm, street_width_m, purchase_price, status, created_at FROM lands
        EXCEPT
-       SELECT id, city, plan_number, land_number, area_sqm, street_width_m, purchase_price, status, created_at FROM seed_snapshot))$$);
+       SELECT id, city, plan_number, land_number, area_sqm, street_width_m, purchase_price, status, created_at FROM tests.seed_snapshot))$$);
 SELECT t_true('arabic: city stored as جدة exactly (U+062C U+062F U+0629, UTF-8 d8acd8afd8a9)',
   $$(SELECT bool_and(encode(convert_to(city, 'UTF8'), 'hex') = 'd8acd8afd8a9') FROM seeded)$$);
 SELECT t_true('arabic: plan 99/أ stored exactly, in logical order (UTF-8 39392fd8a3)',
@@ -61,8 +62,9 @@ SELECT t_true('no fake data: no investors, portfolios, deals, funding, purchases
     + (SELECT count(*) FROM capital_movements) + (SELECT count(*) FROM deal_sales) + (SELECT count(*) FROM payouts) = 0$$);
 SELECT t_true('city: all three seeded lands resolve to city code jeddah, English name Jeddah',
   $$(SELECT bool_and(l.city_code = 'jeddah' AND c.name_en = 'Jeddah') FROM seeded l JOIN cities c ON c.code = l.city_code)$$);
-CREATE FUNCTION t_dup_rejected(p_city text) RETURNS boolean LANGUAGE plpgsql AS $$
+CREATE FUNCTION tests.t_dup_rejected(p_city text) RETURNS boolean LANGUAGE plpgsql AS $$
 BEGIN
+  PERFORM erp_act_as_system();
   INSERT INTO lands (city, plan_number, land_number) VALUES (p_city, '87', '560');
   RAISE EXCEPTION 'T_NO_ERROR';
 EXCEPTION
@@ -71,6 +73,14 @@ EXCEPTION
 END $$;
 SELECT t_true('city: the same seeded land entered as "Jeddah" is recognized as a duplicate',
   $$t_dup_rejected('Jeddah')$$);
+SELECT t_true('accountability: seeded lands were created by the system user, never updated',
+  $$(SELECT bool_and(created_by = erp_system_user_id() AND updated_by IS NULL AND updated_at IS NULL) FROM seeded)$$);
+SELECT t_true('accountability: audit trail holds exactly one "create" per seeded land, by the system user (second run wrote nothing)',
+  $$(SELECT count(*) FILTER (WHERE action = 'create' AND entity_type = 'lands' AND actor_id = erp_system_user_id()) = 3
+            AND count(*) = 3 FROM audit_events)$$);
+SELECT t_true('no fake data: the only employee is the built-in system user (no fake accounts or credentials)',
+  $$(SELECT count(*) FROM app_users) = 1 AND (SELECT bool_and(is_system) FROM app_users)
+    AND (SELECT count(*) FROM user_credentials) = 0$$);
 SELECT t_true('no fake data: no purchase dates, street names or asking prices invented',
   $$(SELECT bool_and(acquired_on IS NULL AND street IS NULL AND sale_price IS NULL AND title IS NULL) FROM seeded)$$);
 

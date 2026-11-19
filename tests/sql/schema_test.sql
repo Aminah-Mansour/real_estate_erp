@@ -6,16 +6,32 @@ SET client_min_messages = warning;
 \o /dev/null
 
 -- ---------------------------------------------------------------------------
--- Harness
+-- Harness (in schema "tests", outside the protected public schema)
+-- The database allows ONE employee per transaction, so every test acts as exactly one employee:
+--   t_ok / t_err            act as Accountant One u(9001)
+--   t_ok_as / t_err_as      act as the given employee (e.g. an admin approving)
+--   t_ok_nobody / t_err_nobody  no acting employee (the test names one itself, or none at all)
+-- Journal entries that a test needs posted are drafted by Accountant Two u(9005) in a SEPARATE, committed
+-- database session (t_remote, via dblink) and then posted by the test's own employee: the real four-eyes
+-- workflow, never a switch of identity inside one transaction.
 -- ---------------------------------------------------------------------------
-CREATE TABLE t_results (n serial PRIMARY KEY, name text NOT NULL, ok boolean NOT NULL, detail text);
+CREATE SCHEMA tests;
+SET search_path = public, tests;
+CREATE EXTENSION dblink SCHEMA tests;
+SELECT tests.dblink_connect('drafter', 'host=127.0.0.1 dbname=' || current_database() || ' user=postgres');
+CREATE TABLE tests.t_results (n serial PRIMARY KEY, name text NOT NULL, ok boolean NOT NULL, detail text);
 
-CREATE FUNCTION u(n int) RETURNS uuid LANGUAGE sql IMMUTABLE AS $$ SELECT lpad(to_hex(n), 32, '0')::uuid $$;
+CREATE FUNCTION tests.u(n int) RETURNS uuid LANGUAGE sql IMMUTABLE AS $$ SELECT lpad(to_hex(n), 32, '0')::uuid $$;
+-- Session token of a test employee (opened in the fixtures below).
+CREATE FUNCTION tests.t_tok(p_user uuid) RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT 'test-session-token-' || p_user::text $$;
 
-CREATE FUNCTION t_ok(p_name text, VARIADIC p_stmts text[]) RETURNS void LANGUAGE plpgsql AS $$
+CREATE FUNCTION tests.t_ok_as(p_actor uuid, p_name text, VARIADIC p_stmts text[]) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE s text;
 BEGIN
   BEGIN
+    IF p_actor IS NOT NULL THEN
+      PERFORM erp_act_as(t_tok(p_actor));
+    END IF;
     FOREACH s IN ARRAY p_stmts LOOP EXECUTE s; END LOOP;
     SET CONSTRAINTS ALL IMMEDIATE;
     SET CONSTRAINTS ALL DEFERRED;
@@ -25,10 +41,13 @@ BEGIN
   END;
 END $$;
 
-CREATE FUNCTION t_err(p_name text, p_pattern text, VARIADIC p_stmts text[]) RETURNS void LANGUAGE plpgsql AS $$
+CREATE FUNCTION tests.t_err_core(p_actor uuid, p_name text, p_pattern text, p_stmts text[]) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE s text;
 BEGIN
   BEGIN
+    IF p_actor IS NOT NULL THEN
+      PERFORM erp_act_as(t_tok(p_actor));
+    END IF;
     FOREACH s IN ARRAY p_stmts LOOP EXECUTE s; END LOOP;
     SET CONSTRAINTS ALL IMMEDIATE;
     RAISE EXCEPTION 'T_NO_ERROR';
@@ -44,42 +63,95 @@ BEGIN
   SET CONSTRAINTS ALL DEFERRED;
 END $$;
 
-CREATE FUNCTION t_true(p_name text, p_expr text) RETURNS void LANGUAGE plpgsql AS $$
+CREATE FUNCTION tests.t_ok(p_name text, VARIADIC p_stmts text[]) RETURNS void LANGUAGE sql AS
+$$ SELECT tests.t_ok_as(tests.u(9001), p_name, VARIADIC p_stmts) $$;
+CREATE FUNCTION tests.t_ok_nobody(p_name text, VARIADIC p_stmts text[]) RETURNS void LANGUAGE sql AS
+$$ SELECT tests.t_ok_as(NULL::uuid, p_name, VARIADIC p_stmts) $$;
+CREATE FUNCTION tests.t_err_as(p_actor uuid, p_name text, p_pattern text, VARIADIC p_stmts text[]) RETURNS void LANGUAGE sql AS
+$$ SELECT tests.t_err_core(p_actor, p_name, p_pattern, p_stmts) $$;
+CREATE FUNCTION tests.t_err(p_name text, p_pattern text, VARIADIC p_stmts text[]) RETURNS void LANGUAGE sql AS
+$$ SELECT tests.t_err_core(tests.u(9001), p_name, p_pattern, p_stmts) $$;
+CREATE FUNCTION tests.t_err_nobody(p_name text, p_pattern text, VARIADIC p_stmts text[]) RETURNS void LANGUAGE sql AS
+$$ SELECT tests.t_err_core(NULL, p_name, p_pattern, p_stmts) $$;
+
+CREATE FUNCTION tests.t_true(p_name text, p_expr text) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE b boolean;
 BEGIN
   EXECUTE 'SELECT (' || p_expr || ')' INTO b;
   INSERT INTO t_results (name, ok, detail) VALUES (p_name, coalesce(b, false), CASE WHEN b THEN 'ok' ELSE 'false: ' || p_expr END);
 END $$;
 
+-- Runs p_sql in the separate drafter session, as Accountant Two u(9005), and commits it.
+CREATE FUNCTION tests.t_remote(p_sql text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM tests.dblink_exec('drafter',
+    'BEGIN; SET LOCAL ROLE erp_app; SET LOCAL search_path = public, tests; '
+    || 'SELECT erp_act_as(tests.t_tok(tests.u(9005))); ' || p_sql || '; COMMIT;');
+EXCEPTION WHEN OTHERS THEN
+  PERFORM tests.dblink_exec('drafter', 'ROLLBACK');
+  RAISE;
+END $$;
+
 -- Ledger accounts used below: u(21) bank (cash), u(22) land inventory, u(23) investor capital,
 -- u(24) land sale revenue, u(25) distributions payable, u(26) deal expenses, u(27) D1 project costs (D1 only).
 
--- Draft entry with one debit and one credit line; posted unless p_post is false.
-CREATE FUNCTION t_entry(p_id uuid, p_debit uuid, p_credit uuid, p_amount numeric,
-                        p_post boolean DEFAULT true, p_reverses uuid DEFAULT NULL) RETURNS uuid LANGUAGE plpgsql AS $$
+-- Accountant Two drafts an entry (one debit, one credit line) in the separate committed session.
+-- A leftover draft with the same id (from an earlier rolled-back test) is replaced.
+CREATE FUNCTION tests.t_draft(p_id uuid, p_debit uuid, p_credit uuid, p_amount numeric,
+                              p_reverses uuid DEFAULT NULL, p_debit_deal uuid DEFAULT NULL) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
-  INSERT INTO journal_entries (id, occurred_on, description, reverses_entry_id) VALUES (p_id, current_date, 'test entry', p_reverses);
-  INSERT INTO journal_lines (journal_entry_id, ledger_account_id, debit) VALUES (p_id, p_debit, p_amount);
-  INSERT INTO journal_lines (journal_entry_id, ledger_account_id, credit) VALUES (p_id, p_credit, p_amount);
+  PERFORM t_remote(format(
+    'DELETE FROM journal_lines WHERE journal_entry_id = %1$L AND EXISTS (SELECT 1 FROM journal_entries WHERE id = %1$L AND status = ''draft''); '
+    'DELETE FROM journal_entries WHERE id = %1$L AND status = ''draft''; '
+    'DELETE FROM journal_lines WHERE journal_entry_id IN (SELECT id FROM journal_entries WHERE reverses_entry_id = %5$L AND status = ''draft''); '
+    'DELETE FROM journal_entries WHERE reverses_entry_id = %5$L AND status = ''draft''; '
+    'INSERT INTO journal_entries (id, occurred_on, description, reverses_entry_id) VALUES (%1$L, current_date, ''test entry'', %5$L); '
+    'INSERT INTO journal_lines (journal_entry_id, ledger_account_id, debit, deal_id) VALUES (%1$L, %2$L, %4$L, %6$L); '
+    'INSERT INTO journal_lines (journal_entry_id, ledger_account_id, credit) VALUES (%1$L, %3$L, %4$L)',
+    p_id, p_debit, p_credit, p_amount, p_reverses, p_debit_deal));
+END $$;
+
+-- The test's employee posts an entry (never one they drafted: four-eyes).
+CREATE FUNCTION tests.t_post(p_entry uuid) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE journal_entries SET status = 'posted' WHERE id = p_entry;
+END $$;
+
+-- Posted entry: drafted by Accountant Two in a separate session, posted by the test's employee.
+-- With p_post false: drafted by the test's own employee, left as draft.
+CREATE FUNCTION tests.t_entry(p_id uuid, p_debit uuid, p_credit uuid, p_amount numeric,
+                              p_post boolean DEFAULT true, p_reverses uuid DEFAULT NULL) RETURNS uuid LANGUAGE plpgsql AS $$
+BEGIN
   IF p_post THEN
-    UPDATE journal_entries SET status = 'posted', posted_at = now(), approved_by = u(9999) WHERE id = p_id;
+    PERFORM t_draft(p_id, p_debit, p_credit, p_amount, p_reverses);
+    PERFORM t_post(p_id);
+  ELSE
+    INSERT INTO journal_entries (id, occurred_on, description, reverses_entry_id) VALUES (p_id, current_date, 'test entry', p_reverses);
+    INSERT INTO journal_lines (journal_entry_id, ledger_account_id, debit) VALUES (p_id, p_debit, p_amount);
+    INSERT INTO journal_lines (journal_entry_id, ledger_account_id, credit) VALUES (p_id, p_credit, p_amount);
   END IF;
   RETURN p_id;
 END $$;
 
--- Exact reversal of p_orig, posted, with p_orig marked reversed.
-CREATE FUNCTION t_reverse(p_new uuid, p_orig uuid) RETURNS void LANGUAGE plpgsql AS $$
+-- Exact reversal of p_orig (which must already be posted and committed): drafted by Accountant Two,
+-- posted by the test's employee, who also marks the original reversed.
+CREATE FUNCTION tests.t_reverse(p_new uuid, p_orig uuid) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
-  INSERT INTO journal_entries (id, occurred_on, description, reverses_entry_id) VALUES (p_new, current_date, 'reversal', p_orig);
-  INSERT INTO journal_lines (journal_entry_id, ledger_account_id, debit, credit, portfolio_id, deal_id, investor_id)
-    SELECT p_new, ledger_account_id, credit, debit, portfolio_id, deal_id, investor_id
-      FROM journal_lines WHERE journal_entry_id = p_orig;
-  UPDATE journal_entries SET status = 'posted', posted_at = now(), approved_by = u(9999) WHERE id = p_new;
+  PERFORM t_remote(format(
+    'DELETE FROM journal_lines WHERE journal_entry_id = %1$L AND EXISTS (SELECT 1 FROM journal_entries WHERE id = %1$L AND status = ''draft''); '
+    'DELETE FROM journal_entries WHERE id = %1$L AND status = ''draft''; '
+    'DELETE FROM journal_lines WHERE journal_entry_id IN (SELECT id FROM journal_entries WHERE reverses_entry_id = %2$L AND status = ''draft''); '
+    'DELETE FROM journal_entries WHERE reverses_entry_id = %2$L AND status = ''draft''; '
+    'INSERT INTO journal_entries (id, occurred_on, description, reverses_entry_id) VALUES (%1$L, current_date, ''reversal'', %2$L); '
+    'INSERT INTO journal_lines (journal_entry_id, ledger_account_id, debit, credit, portfolio_id, deal_id, investor_id) '
+    '  SELECT %1$L, ledger_account_id, credit, debit, portfolio_id, deal_id, investor_id FROM journal_lines WHERE journal_entry_id = %2$L',
+    p_new, p_orig));
+  PERFORM t_post(p_new);
   UPDATE journal_entries SET status = 'reversed' WHERE id = p_orig;
 END $$;
 
 -- Capital movement backed by a posted entry.
-CREATE FUNCTION t_move(p_id uuid, p_account uuid, p_kind text, p_amount numeric, p_group uuid DEFAULT NULL)
+CREATE FUNCTION tests.t_move(p_id uuid, p_account uuid, p_kind text, p_amount numeric, p_group uuid DEFAULT NULL)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE je uuid := gen_random_uuid();
 BEGIN
@@ -93,7 +165,7 @@ BEGIN
 END $$;
 
 -- Land purchase: pays price + 5% purchase tax + 2.5% Dalalah from the bank.
-CREATE FUNCTION t_purchase(p_deal uuid, p_land uuid) RETURNS void LANGUAGE plpgsql AS $$
+CREATE FUNCTION tests.t_purchase(p_deal uuid, p_land uuid) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE je uuid := gen_random_uuid(); price numeric;
 BEGIN
   SELECT purchase_price INTO price FROM lands WHERE id = p_land;
@@ -102,28 +174,26 @@ BEGIN
 END $$;
 
 -- Expense paid from the bank, against p_land (NULL = the deal's original land).
-CREATE FUNCTION t_cost(p_id uuid, p_deal uuid, p_amount numeric, p_account uuid DEFAULT u(26), p_category text DEFAULT 'survey',
-                       p_land uuid DEFAULT NULL)
+CREATE FUNCTION tests.t_cost(p_id uuid, p_deal uuid, p_amount numeric, p_account uuid DEFAULT u(26), p_category text DEFAULT 'survey',
+                             p_land uuid DEFAULT NULL)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE je uuid := gen_random_uuid();
 BEGIN
-  INSERT INTO journal_entries (id, occurred_on, description) VALUES (je, current_date, 'deal cost');
-  INSERT INTO journal_lines (journal_entry_id, ledger_account_id, debit, deal_id) VALUES (je, p_account, p_amount, p_deal);
-  INSERT INTO journal_lines (journal_entry_id, ledger_account_id, credit) VALUES (je, u(21), p_amount);
-  UPDATE journal_entries SET status = 'posted', posted_at = now(), approved_by = u(9999) WHERE id = je;
+  PERFORM t_draft(je, p_account, u(21), p_amount, NULL, p_deal);
+  PERFORM t_post(je);
   INSERT INTO deal_costs (id, deal_id, land_id, category, amount, incurred_on, journal_entry_id)
   VALUES (coalesce(p_id, gen_random_uuid()), p_deal, p_land, p_category, p_amount, current_date, je);
 END $$;
 
 -- A sale paid in full: posted entry debiting cash by the sale amount, then the sale row.
-CREATE FUNCTION t_sale(p_sale uuid, p_deal uuid, p_land uuid, p_amount numeric, p_entry uuid) RETURNS void LANGUAGE plpgsql AS $$
+CREATE FUNCTION tests.t_sale(p_sale uuid, p_deal uuid, p_land uuid, p_amount numeric, p_entry uuid) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
   PERFORM t_entry(p_entry, u(21), u(24), p_amount);
   INSERT INTO deal_sales (id, deal_id, land_id, sale_amount, sold_on, buyer_name, payment_reference, journal_entry_id)
   VALUES (p_sale, p_deal, p_land, p_amount, current_date, 'Buyer ' || p_sale, 'TRX-' || p_sale, p_entry);
 END $$;
 
-CREATE FUNCTION t_parcel(p_id uuid, p_parent uuid, p_land_number text, p_price numeric DEFAULT NULL, p_area numeric DEFAULT NULL)
+CREATE FUNCTION tests.t_parcel(p_id uuid, p_parent uuid, p_land_number text, p_price numeric DEFAULT NULL, p_area numeric DEFAULT NULL)
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
   INSERT INTO lands (id, parent_land_id, city, plan_number, land_number, status, purchase_price, area_sqm)
@@ -131,50 +201,83 @@ BEGIN
 END $$;
 
 -- Draft profit realization for one sale (expenses are allocated automatically on approval).
-CREATE FUNCTION t_realize(p_id uuid, p_deal uuid, p_sale uuid) RETURNS void LANGUAGE plpgsql AS $$
+CREATE FUNCTION tests.t_realize(p_id uuid, p_deal uuid, p_sale uuid) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
   INSERT INTO profit_realizations (id, deal_id, deal_sale_id, realized_on) VALUES (p_id, p_deal, p_sale, current_date);
 END $$;
 
 -- Draft closing realization for a deal's leftover expenses.
-CREATE FUNCTION t_close(p_id uuid, p_deal uuid) RETURNS void LANGUAGE plpgsql AS $$
+CREATE FUNCTION tests.t_close(p_id uuid, p_deal uuid) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
   INSERT INTO profit_realizations (id, deal_id, kind, realized_on) VALUES (p_id, p_deal, 'closing', current_date);
 END $$;
 
-CREATE FUNCTION t_approve_realization(p_id uuid) RETURNS void LANGUAGE plpgsql AS $$
+-- Approves a realization as the test's employee (an admin, in its own transaction).
+CREATE FUNCTION tests.t_approve_realization(p_id uuid) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
-  UPDATE profit_realizations SET status = 'approved', approved_by = u(9999) WHERE id = p_id;
+  UPDATE profit_realizations SET status = 'approved' WHERE id = p_id;
 END $$;
 
-CREATE FUNCTION t_line(p_id uuid, p_batch uuid, p_account uuid, p_type text, p_capital numeric, p_profit numeric)
+CREATE FUNCTION tests.t_line(p_id uuid, p_batch uuid, p_account uuid, p_type text, p_capital numeric, p_profit numeric)
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
   INSERT INTO distribution_lines (id, batch_id, funding_account_id, beneficiary_type, amount, capital_component, profit_component)
   VALUES (coalesce(p_id, gen_random_uuid()), p_batch, p_account, p_type, p_capital + p_profit, p_capital, p_profit);
 END $$;
 
-CREATE FUNCTION t_office(p_id uuid, p_batch uuid, p_amount numeric) RETURNS void LANGUAGE plpgsql AS $$
+CREATE FUNCTION tests.t_office(p_id uuid, p_batch uuid, p_amount numeric) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
   INSERT INTO distribution_lines (id, batch_id, beneficiary_type, amount) VALUES (coalesce(p_id, gen_random_uuid()), p_batch, 'office', p_amount);
 END $$;
 
-CREATE FUNCTION t_approve_batch(p_batch uuid) RETURNS void LANGUAGE plpgsql AS $$
+-- Approves a batch as the test's employee (an admin, in its own transaction), with a posted payable entry.
+CREATE FUNCTION tests.t_approve_batch(p_batch uuid) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE je uuid := gen_random_uuid(); amt numeric;
 BEGIN
   SELECT amount INTO amt FROM distribution_batches WHERE id = p_batch;
   PERFORM t_entry(je, u(24), u(25), amt);
-  UPDATE distribution_batches SET status = 'approved', approved_at = now(), journal_entry_id = je WHERE id = p_batch;
+  UPDATE distribution_batches SET status = 'approved', journal_entry_id = je WHERE id = p_batch;
 END $$;
 
-CREATE FUNCTION t_payout(p_line uuid, p_amount numeric) RETURNS void LANGUAGE plpgsql AS $$
+CREATE FUNCTION tests.t_payout(p_line uuid, p_amount numeric) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE je uuid := gen_random_uuid();
 BEGIN
   PERFORM t_entry(je, u(25), u(21), p_amount);
   INSERT INTO payouts (distribution_line_id, amount, paid_on, journal_entry_id) VALUES (p_line, p_amount, current_date, je);
 END $$;
 
-CREATE FUNCTION land_status(p_id uuid) RETURNS text LANGUAGE sql AS $$ SELECT status FROM lands WHERE id = p_id $$;
+CREATE FUNCTION tests.land_status(p_id uuid) RETURNS text LANGUAGE sql AS $$ SELECT status FROM lands WHERE id = p_id $$;
+
+-- ---------------------------------------------------------------------------
+-- Employees and the test session
+--   u(9999) Admin One (created with erp_bootstrap_admin), u(9004) Admin Two,
+--   u(9001) Accountant One (default acting employee / preparer), u(9005) Accountant Two,
+--   u(9002) Data Entry One, u(9003) Viewer One, u(9006) Disabled Accountant
+-- Everything after this block runs as the restricted application role erp_app, not as the table owner.
+-- ---------------------------------------------------------------------------
+SELECT erp_bootstrap_admin('Admin One', 'admin.one@office.test', u(9999));
+SELECT erp_open_session(u(9999), t_tok(u(9999)));
+BEGIN;
+SELECT erp_act_as(t_tok(u(9999)));
+INSERT INTO app_users (id, full_name, email, role) VALUES
+  (u(9004), 'Admin Two',           'admin.two@office.test',      'admin'),
+  (u(9001), 'Accountant One',      'accountant.one@office.test', 'accountant'),
+  (u(9005), 'Accountant Two',      'accountant.two@office.test', 'accountant'),
+  (u(9002), 'Data Entry One',      'data.entry@office.test',     'data_entry'),
+  (u(9003), 'Viewer One',          'viewer@office.test',         'viewer'),
+  (u(9006), 'Disabled Accountant', 'former@office.test',         'accountant');
+COMMIT;
+-- The login service opens one session per employee (the disabled one before being disabled).
+SELECT erp_open_session(id, t_tok(id)) FROM app_users WHERE NOT is_system AND id <> u(9999);
+BEGIN;
+SELECT erp_act_as(t_tok(u(9999)));
+UPDATE app_users SET status = 'disabled' WHERE id = u(9006);
+COMMIT;
+GRANT USAGE ON SCHEMA tests TO erp_app, erp_auth, erp_readonly;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA tests TO erp_app, erp_auth, erp_readonly;
+GRANT SELECT, INSERT ON tests.t_results TO erp_app, erp_auth, erp_readonly;
+GRANT USAGE ON SEQUENCE tests.t_results_n_seq TO erp_app, erp_auth, erp_readonly;
+SET ROLE erp_app;
 
 -- ---------------------------------------------------------------------------
 -- Fixtures (acquisition cost = price x 1.075)
@@ -185,6 +288,8 @@ CREATE FUNCTION land_status(p_id uuid) RETURNS text LANGUAGE sql AS $$ SELECT st
 --   L5 u(109) Medina   400,000          -> D5 u(207): acquisition   430,000 funded by I3 440,000 (u(311))
 --   P1 cash after funding D1: 1,000,000 - 645,000 = 355,000
 -- ---------------------------------------------------------------------------
+BEGIN;
+SELECT erp_act_as(t_tok(u(9001)));
 INSERT INTO investors (id, full_name) VALUES (u(1), 'Investor One'), (u(2), 'Investor Two'), (u(3), 'Investor Three');
 INSERT INTO portfolios (id, name) VALUES (u(11), 'Shared Portfolio One'), (u(12), 'Portfolio Two');
 
@@ -219,7 +324,11 @@ INSERT INTO funding_accounts (id, portfolio_id, deal_id, investor_id, parent_por
   (u(306), NULL, u(204), u(2), NULL),    -- I2 directly in D4
   (u(307), u(12), NULL, u(3), NULL),     -- I3 in P2
   (u(311), NULL, u(207), u(3), NULL);    -- I3 directly in D5
+COMMIT;
 
+-- Money movements: each entry is drafted by Accountant Two (separate session) and posted by Accountant One.
+BEGIN;
+SELECT erp_act_as(t_tok(u(9001)));
 SELECT t_move(u(801), u(301), 'contribution', 600000);
 SELECT t_move(u(802), u(302), 'contribution', 400000);
 SELECT t_move(u(803), u(303), 'contribution', 645000);
@@ -231,6 +340,7 @@ SELECT t_purchase(u(201), u(101));
 SELECT t_purchase(u(202), u(102));
 SELECT t_purchase(u(204), u(106));
 SELECT t_purchase(u(207), u(109));
+COMMIT;
 
 -- ---------------------------------------------------------------------------
 -- Purchase charges: 5% purchase tax + 2.5% Dalalah, on purchase only
@@ -284,14 +394,14 @@ SELECT t_true('tax: purchase tax is the only stored tax column; Dalalah is a sep
        FROM information_schema.columns c
        JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name
       WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE'
-        AND (c.column_name LIKE '%tax%' OR c.column_name LIKE '%vat%' OR c.column_name LIKE '%dalalah%'))
+        AND c.column_name ~ '(^|_)(tax|vat|dalalah)(_|$)')
     = ARRAY['land_purchases.dalalah', 'land_purchases.purchase_tax']$$);
 SELECT t_true('tax: the only view showing charges is the acquisition preview, with the same two charges and no VAT',
   $$(SELECT array_agg(c.table_name || '.' || c.column_name ORDER BY c.table_name, c.column_name)
        FROM information_schema.columns c
        JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name
       WHERE c.table_schema = 'public' AND t.table_type = 'VIEW'
-        AND (c.column_name LIKE '%tax%' OR c.column_name LIKE '%vat%' OR c.column_name LIKE '%dalalah%'))
+        AND c.column_name ~ '(^|_)(tax|vat|dalalah)(_|$)')
     = ARRAY['land_acquisition_preview.dalalah', 'land_acquisition_preview.purchase_tax']$$);
 
 -- ---------------------------------------------------------------------------
@@ -545,9 +655,10 @@ SELECT t_err('overspend: I1 cannot withdraw cash the portfolio has invested (500
   $$SELECT t_move(NULL, u(301), 'withdrawal', 500000)$$);
 SELECT t_err('overspend: deal cannot return more capital than P1 holds in it', 'net capital would be',
   $$SELECT t_move(NULL, u(303), 'return_of_capital', 2000000)$$);
-SELECT t_err('overspend: P1 cannot be closed while it holds cash', 'cannot close',
+SELECT t_err_as(u(9999), 'overspend: P1 cannot be closed while it holds cash', 'cannot close',
   $$UPDATE portfolios SET status = 'closed' WHERE id = u(11)$$);
-SELECT t_ok('overspend: empty P2 can be closed', $$UPDATE portfolios SET status = 'closed' WHERE id = u(12)$$);
+SELECT t_ok_as(u(9999), 'overspend: empty P2 can be closed',
+  $$UPDATE portfolios SET status = 'closed' WHERE id = u(12)$$);
 SELECT t_err('overspend: closed portfolio accepts no money', 'is closed',
   $$SELECT t_move(NULL, u(307), 'contribution', 1000)$$);
 
@@ -568,8 +679,8 @@ SELECT t_err('expense: recorded cost cannot be deleted', 'cannot be deleted',
   $$DELETE FROM deal_costs WHERE id = u(901)$$);
 SELECT t_err('expense: cost cannot be voided before its journal entry is reversed', 'reverse its journal entry',
   $$UPDATE deal_costs SET status = 'voided' WHERE id = u(901)$$);
-SELECT t_ok('expense: mistaken cost reversed and voided',
-  $$SELECT t_cost(u(902), u(201), 1000)$$,
+SELECT t_ok('expense: a mistaken cost is recorded', $$SELECT t_cost(u(902), u(201), 1000)$$);
+SELECT t_ok('expense: the mistaken cost is reversed and voided',
   $$SELECT t_reverse(gen_random_uuid(), (SELECT journal_entry_id FROM deal_costs WHERE id = u(902)))$$,
   $$UPDATE deal_costs SET status = 'voided' WHERE id = u(902)$$);
 
@@ -577,15 +688,15 @@ SELECT t_ok('expense: mistaken cost reversed and voided',
 -- Accounting
 -- ---------------------------------------------------------------------------
 SELECT t_err('journal: unbalanced entry cannot be posted', 'debits 100.00, credits 90.00',
-  $$INSERT INTO journal_entries (id, occurred_on, description) VALUES (u(1210), current_date, 'unbalanced')$$,
-  $$INSERT INTO journal_lines (journal_entry_id, ledger_account_id, debit) VALUES (u(1210), u(21), 100)$$,
-  $$INSERT INTO journal_lines (journal_entry_id, ledger_account_id, credit) VALUES (u(1210), u(23), 90)$$,
-  $$UPDATE journal_entries SET status = 'posted', posted_at = now(), approved_by = u(9999) WHERE id = u(1210)$$);
+  $$SELECT t_remote('INSERT INTO journal_entries (id, occurred_on, description) VALUES (u(1210), current_date, ''unbalanced'');
+                     INSERT INTO journal_lines (journal_entry_id, ledger_account_id, debit) VALUES (u(1210), u(21), 100);
+                     INSERT INTO journal_lines (journal_entry_id, ledger_account_id, credit) VALUES (u(1210), u(23), 90)')$$,
+  $$SELECT t_post(u(1210))$$);
 SELECT t_err('journal: single-line entry cannot be posted', 'at least two lines',
-  $$INSERT INTO journal_entries (id, occurred_on, description) VALUES (u(1211), current_date, 'one line')$$,
-  $$INSERT INTO journal_lines (journal_entry_id, ledger_account_id, debit) VALUES (u(1211), u(21), 100)$$,
-  $$UPDATE journal_entries SET status = 'posted', posted_at = now(), approved_by = u(9999) WHERE id = u(1211)$$);
-SELECT t_err('journal: posting requires approver and posting time', 'journal_entries_posting_recorded',
+  $$SELECT t_remote('INSERT INTO journal_entries (id, occurred_on, description) VALUES (u(1211), current_date, ''one line'');
+                     INSERT INTO journal_lines (journal_entry_id, ledger_account_id, debit) VALUES (u(1211), u(21), 100)')$$,
+  $$SELECT t_post(u(1211))$$);
+SELECT t_err('journal: entries are created as draft (posting is a separate step by a second employee)', 'must be created as draft',
   $$INSERT INTO journal_entries (occurred_on, description, status) VALUES (current_date, 'no approver', 'posted')$$);
 SELECT t_err('journal: line cannot be both debit and credit', 'journal_lines_check',
   $$INSERT INTO journal_entries (id, occurred_on, description) VALUES (u(1212), current_date, 'bad line')$$,
@@ -612,7 +723,7 @@ SELECT t_ok('journal: exact reversal posted and original marked reversed',
 SELECT t_err('journal: an entry cannot be reversed twice', 'only a posted entry can be reversed',
   $$SELECT t_reverse(u(1204), u(1201))$$);
 SELECT t_err('journal: a draft entry cannot be reversed', 'only a posted entry can be reversed',
-  $$SELECT t_entry(u(1205), u(21), u(23), 10, false)$$,
+  $$SELECT t_draft(u(1205), u(21), u(23), 10)$$,
   $$SELECT t_reverse(u(1206), u(1205))$$);
 
 -- ---------------------------------------------------------------------------
@@ -627,8 +738,9 @@ SELECT t_err('journal: a draft entry cannot be reversed', 'only a posted entry c
 -- ---------------------------------------------------------------------------
 SELECT t_err('realization: must be created as draft', 'must be created as draft',
   $$INSERT INTO profit_realizations (deal_id, deal_sale_id, realized_on, status) VALUES (u(202), u(406), current_date, 'approved')$$);
-SELECT t_ok('realization: worked example (whole land) approved',
-  $$SELECT t_realize(u(702), u(202), u(406))$$,
+SELECT t_ok('realization: worked example (whole land) approved [step 1 of 2: Accountant One]',
+  $$SELECT t_realize(u(702), u(202), u(406))$$);
+SELECT t_ok_as(u(9999), 'realization: worked example (whole land) approved [step 2 of 2: Admin One]',
   $$SELECT t_approve_realization(u(702))$$);
 SELECT t_true('realization: example = sale 1,500,000, acquisition 1,075,000, profit 425,000, office fee 106,250, distributable 318,750',
   $$(SELECT (sale_proceeds, acquisition_cost, expenses, profit_before_fee, office_fee, net_profit, distributable_profit, returnable_capital)
@@ -648,13 +760,16 @@ SELECT t_err('realization: expense allocations cannot be entered by hand', 'allo
   $$INSERT INTO realization_costs (realization_id, deal_id, deal_cost_id, amount) VALUES (u(701), u(201), u(901), 1)$$);
 SELECT t_err('realization: a closing realization has no sale', 'profit_realizations_kind_sale',
   $$INSERT INTO profit_realizations (deal_id, kind, deal_sale_id, realized_on) VALUES (u(201), 'closing', u(402), current_date)$$);
-SELECT t_err('realization: closing not allowed while sales still lack approved profit', 'approve the profit on every sale',
-  $$SELECT t_close(u(712), u(201))$$, $$SELECT t_approve_realization(u(712))$$);
+SELECT t_ok('realization: closing not allowed while sales still lack approved profit [step 1 of 2: Accountant One] (setup)',
+  $$SELECT t_close(u(712), u(201))$$);
+SELECT t_err_as(u(9999), 'realization: closing not allowed while sales still lack approved profit', 'approve the profit on every sale',
+  $$SELECT t_approve_realization(u(712))$$);
 SELECT t_err('realization: a sale with a realization cannot be voided', 'included in a profit realization',
   $$UPDATE deal_sales SET status = 'voided' WHERE id = u(401)$$);
-SELECT t_err('realization: deal cannot be settled with unrealized sales', 'every sale and expense',
+SELECT t_err_as(u(9999), 'realization: deal cannot be settled with unrealized sales', 'every sale and expense',
   $$UPDATE deals SET status = 'settled' WHERE id = u(201)$$);
-SELECT t_ok('realization: RA approved', $$SELECT t_approve_realization(u(701))$$);
+SELECT t_ok_as(u(9999), 'realization: RA approved',
+  $$SELECT t_approve_realization(u(701))$$);
 SELECT t_true('realization: parcel A gets 30% of acquisition cost (322,500); profit 62,500; fee 15,625; distributable 46,875',
   $$(SELECT (sale_proceeds, acquisition_cost, expenses, profit_before_fee, office_fee, distributable_profit, returnable_capital)
        = (400000.00, 322500.00, 15000.00, 62500.00, 15625.00, 46875.00, 337500.00)
@@ -670,12 +785,21 @@ SELECT t_true('realization: survey on parcel A allocated to A''s sale in full',
 SELECT t_err('realization: an allocated expense cannot be voided', 'allocated to a profit realization',
   $$UPDATE deal_costs SET status = 'voided' WHERE id = u(901)$$);
 SELECT t_err('realization: office fee rule holds even if the approval trigger is bypassed', 'profit_realizations_office_fee_rule',
+  $$RESET ROLE$$,
   $$ALTER TABLE profit_realizations DISABLE TRIGGER profit_realizations_before_write$$,
   $$UPDATE profit_realizations SET office_fee = 10000 WHERE id = u(701)$$);
-SELECT t_ok('realization: RB1, RB2 and RC approved, each sale separately',
-  $$SELECT t_realize(u(708), u(201), u(402))$$, $$SELECT t_approve_realization(u(708))$$,
-  $$SELECT t_realize(u(709), u(201), u(403))$$, $$SELECT t_approve_realization(u(709))$$,
-  $$SELECT t_realize(u(703), u(201), u(405))$$, $$SELECT t_approve_realization(u(703))$$);
+SELECT t_ok('realization: RB1, RB2 and RC approved, each sale separately [step 1 of 6: Accountant One]',
+  $$SELECT t_realize(u(708), u(201), u(402))$$);
+SELECT t_ok_as(u(9999), 'realization: RB1, RB2 and RC approved, each sale separately [step 2 of 6: Admin One]',
+  $$SELECT t_approve_realization(u(708))$$);
+SELECT t_ok('realization: RB1, RB2 and RC approved, each sale separately [step 3 of 6: Accountant One]',
+  $$SELECT t_realize(u(709), u(201), u(403))$$);
+SELECT t_ok_as(u(9999), 'realization: RB1, RB2 and RC approved, each sale separately [step 4 of 6: Admin One]',
+  $$SELECT t_approve_realization(u(709))$$);
+SELECT t_ok('realization: RB1, RB2 and RC approved, each sale separately [step 5 of 6: Accountant One]',
+  $$SELECT t_realize(u(703), u(201), u(405))$$);
+SELECT t_ok_as(u(9999), 'realization: RB1, RB2 and RC approved, each sale separately [step 6 of 6: Admin One]',
+  $$SELECT t_approve_realization(u(703))$$);
 SELECT t_true('realization: sub-parcel B1 gets 20% of acquisition cost (215,000); profit 35,000; fee 8,750',
   $$(SELECT (acquisition_cost, profit_before_fee, office_fee, distributable_profit) = (215000.00, 35000.00, 8750.00, 26250.00)
        FROM profit_realizations WHERE id = u(708))$$);
@@ -687,32 +811,35 @@ SELECT t_true('realization: parcel C (resold) profit 397,500; fee 99,375; distri
        FROM profit_realizations WHERE id = u(703))$$);
 SELECT t_true('realization: parcel acquisition costs add up to L1''s 1,075,000',
   $$(SELECT sum(acquisition_cost) FROM profit_realizations WHERE deal_id = u(201)) = 1075000$$);
-SELECT t_ok('realization: D4 land sold at a loss and R4 approved',
+SELECT t_ok('realization: D4 land sold at a loss and R4 approved [step 1 of 2: Accountant One]',
   $$SELECT t_sale(u(420), u(204), u(106), 450000, u(1120))$$,
-  $$SELECT t_realize(u(704), u(204), u(420))$$,
+  $$SELECT t_realize(u(704), u(204), u(420))$$);
+SELECT t_ok_as(u(9999), 'realization: D4 land sold at a loss and R4 approved [step 2 of 2: Admin One]',
   $$SELECT t_approve_realization(u(704))$$);
 SELECT t_true('realization: no office fee on a loss; nothing distributable; 450,000 capital returnable',
   $$(SELECT (acquisition_cost, profit_before_fee, office_fee, distributable_profit, returnable_capital)
        = (537500.00, -87500.00, 0.00, 0.00, 450000.00)
        FROM profit_realizations WHERE id = u(704))$$);
-SELECT t_err('realization: needs the land purchase (with tax and Dalalah) recorded', 'record the land purchase',
+SELECT t_ok('realization: needs the land purchase (with tax and Dalalah) recorded [step 1 of 2: Accountant One] (setup)',
   $$INSERT INTO lands (id, city, plan_number, land_number, purchase_price, status, acquired_on)
     VALUES (u(108), 'Khobar', '77', '1', 200000, 'available', current_date)$$,
   $$INSERT INTO deals (id, land_id, name, status) VALUES (u(206), u(108), 'Khobar 77/1', 'active')$$,
   $$SELECT t_sale(u(421), u(206), u(108), 300000, gen_random_uuid())$$,
-  $$SELECT t_realize(u(707), u(206), u(421))$$,
+  $$SELECT t_realize(u(707), u(206), u(421))$$);
+SELECT t_err_as(u(9999), 'realization: needs the land purchase (with tax and Dalalah) recorded', 'record the land purchase',
   $$SELECT t_approve_realization(u(707))$$);
-SELECT t_err('realization: a sold parcel needs an allocated purchase price', 'allocated purchase price',
+SELECT t_ok('realization: a sold parcel needs an allocated purchase price [step 1 of 2: Accountant One] (setup)',
   $$INSERT INTO lands (id, city, plan_number, land_number, purchase_price, status, acquired_on)
-    VALUES (u(108), 'Khobar', '77', '1', 200000, 'available', current_date)$$,
-  $$INSERT INTO deals (id, land_id, name, status) VALUES (u(206), u(108), 'Khobar 77/1', 'active')$$,
-  $$INSERT INTO funding_accounts (id, deal_id, investor_id) VALUES (u(308), u(206), u(3))$$,
-  $$SELECT t_move(NULL, u(308), 'contribution', 215000)$$,
-  $$SELECT t_purchase(u(206), u(108))$$,
-  $$SELECT t_parcel(u(181), u(108), '1-A')$$,
-  $$SELECT t_sale(u(421), u(206), u(181), 120000, gen_random_uuid())$$,
-  $$SELECT t_realize(u(707), u(206), u(421))$$,
-  $$SELECT t_approve_realization(u(707))$$);
+    VALUES (u(150), 'Khobar', '78', '1', 200000, 'available', current_date)$$,
+  $$INSERT INTO deals (id, land_id, name, status) VALUES (u(250), u(150), 'Khobar 78/1', 'active')$$,
+  $$INSERT INTO funding_accounts (id, deal_id, investor_id) VALUES (u(350), u(250), u(3))$$,
+  $$SELECT t_move(NULL, u(350), 'contribution', 215000)$$,
+  $$SELECT t_purchase(u(250), u(150))$$,
+  $$SELECT t_parcel(u(151), u(150), '1-A')$$,
+  $$SELECT t_sale(u(450), u(250), u(151), 120000, gen_random_uuid())$$,
+  $$SELECT t_realize(u(750), u(250), u(450))$$);
+SELECT t_err_as(u(9999), 'realization: a sold parcel needs an allocated purchase price', 'allocated purchase price',
+  $$SELECT t_approve_realization(u(750))$$);
 
 -- ---------------------------------------------------------------------------
 -- Expenses allocated across parcels, and expenses paid after the last sale (L5 / D5)
@@ -728,33 +855,41 @@ SELECT t_ok('allocation: L5 subdivided and a whole-land fencing expense of 8,000
   $$SELECT t_cost(u(911), u(207), 8000, u(26), 'fencing')$$);
 SELECT t_true('allocation: an expense without a land applies to the deal''s whole land',
   $$(SELECT land_id FROM deal_costs WHERE id = u(911)) = u(109)$$);
-SELECT t_err('allocation: closing not allowed while land is still unsold', 'all of the deal''s land sold',
-  $$SELECT t_close(u(723), u(207))$$, $$SELECT t_approve_realization(u(723))$$);
-SELECT t_ok('allocation: Q1 sold for 150,000 and its profit approved',
+SELECT t_ok('allocation: closing not allowed while land is still unsold [step 1 of 2: Accountant One] (setup)',
+  $$SELECT t_close(u(724), u(207))$$);
+SELECT t_err_as(u(9999), 'allocation: closing not allowed while land is still unsold', 'all of the deal''s land sold',
+  $$SELECT t_approve_realization(u(724))$$);
+SELECT t_ok('allocation: Q1 sold for 150,000 and its profit approved [step 1 of 2: Accountant One]',
   $$SELECT t_sale(u(431), u(207), u(131), 150000, gen_random_uuid())$$,
-  $$SELECT t_realize(u(721), u(207), u(431))$$,
+  $$SELECT t_realize(u(721), u(207), u(431))$$);
+SELECT t_ok_as(u(9999), 'allocation: Q1 sold for 150,000 and its profit approved [step 2 of 2: Admin One]',
   $$SELECT t_approve_realization(u(721))$$);
 SELECT t_true('allocation: Q1 carries 25% of the fencing (2,000); profit 40,500; office fee 10,125; distributable 30,375',
   $$(SELECT (acquisition_cost, expenses, profit_before_fee, office_fee, distributable_profit)
        = (107500.00, 2000.00, 40500.00, 10125.00, 30375.00) FROM profit_realizations WHERE id = u(721))$$);
 SELECT t_ok('allocation: legal fee 1,000 on Q1 paid after its profit was approved',
   $$SELECT t_cost(u(912), u(207), 1000, u(26), 'legal', u(131))$$);
-SELECT t_ok('allocation: Q2 sold for 200,000 at a loss and its profit approved',
+SELECT t_ok('allocation: Q2 sold for 200,000 at a loss and its profit approved [step 1 of 2: Accountant One]',
   $$SELECT t_sale(u(432), u(207), u(132), 200000, gen_random_uuid())$$,
-  $$SELECT t_realize(u(722), u(207), u(432))$$,
+  $$SELECT t_realize(u(722), u(207), u(432))$$);
+SELECT t_ok_as(u(9999), 'allocation: Q2 sold for 200,000 at a loss and its profit approved [step 2 of 2: Admin One]',
   $$SELECT t_approve_realization(u(722))$$);
 SELECT t_true('allocation: Q2 carries the other 75% of the fencing (6,000) and none of Q1''s legal fee; no office fee on the loss',
   $$(SELECT (acquisition_cost, expenses, profit_before_fee, office_fee, distributable_profit)
        = (322500.00, 6000.00, -128500.00, 0.00, 0.00) FROM profit_realizations WHERE id = u(722))$$);
 SELECT t_true('allocation: the fencing is fully allocated (2,000 + 6,000), never more',
   $$(SELECT sum(amount) FROM realization_costs WHERE deal_cost_id = u(911)) = 8000 AND cost_unallocated(u(911)) = 0$$);
-SELECT t_err('allocation: deal cannot be settled while an expense is unallocated', 'use a closing realization',
+SELECT t_err_as(u(9999), 'allocation: deal cannot be settled while an expense is unallocated', 'use a closing realization',
   $$UPDATE deals SET status = 'settled' WHERE id = u(207)$$);
-SELECT t_ok('allocation: closing realization books the leftover legal fee', $$SELECT t_close(u(723), u(207))$$, $$SELECT t_approve_realization(u(723))$$);
+SELECT t_ok('allocation: closing realization books the leftover legal fee [step 1 of 2: Accountant One]',
+  $$SELECT t_close(u(723), u(207))$$);
+SELECT t_ok_as(u(9999), 'allocation: closing realization books the leftover legal fee [step 2 of 2: Admin One]',
+  $$SELECT t_approve_realization(u(723))$$);
 SELECT t_true('allocation: closing realization = expense 1,000, a loss, no office fee, nothing to distribute',
   $$(SELECT (sale_proceeds, acquisition_cost, expenses, office_fee, net_profit, distributable_profit, returnable_capital)
        = (0.00, 0.00, 1000.00, 0.00, -1000.00, 0.00, 0.00) FROM profit_realizations WHERE id = u(723))$$);
-SELECT t_ok('allocation: D5 settles once every expense is allocated', $$UPDATE deals SET status = 'settled' WHERE id = u(207)$$);
+SELECT t_ok_as(u(9999), 'allocation: D5 settles once every expense is allocated',
+  $$UPDATE deals SET status = 'settled' WHERE id = u(207)$$);
 SELECT t_err('allocation: no expenses after a deal is settled', 'is settled',
   $$SELECT t_cost(NULL, u(207), 100)$$);
 
@@ -767,10 +902,11 @@ SELECT t_err('allocation: no expenses after a deal is settled', 'is settled',
 --     I3 (u(304), 40%): capital 135,000 + profit 18,750 = 153,750   line u(511)
 --     office fee 15,625                                              line u(513)
 -- ---------------------------------------------------------------------------
-SELECT t_ok('distribution: worked example - office 106,250, investor profit 318,750 plus capital 1,075,000',
+SELECT t_ok('distribution: worked example - office 106,250, investor profit 318,750 plus capital 1,075,000 [step 1 of 2: Accountant One]',
   $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(530), u(202), 1500000, u(702))$$,
   $$SELECT t_line(NULL, u(530), u(305), 'investor', 1075000, 318750)$$,
-  $$SELECT t_office(NULL, u(530), 106250)$$,
+  $$SELECT t_office(NULL, u(530), 106250)$$);
+SELECT t_ok_as(u(9999), 'distribution: worked example - office 106,250, investor profit 318,750 plus capital 1,075,000 [step 2 of 2: Admin One]',
   $$SELECT t_approve_batch(u(530))$$);
 SELECT t_ok('distribution: DB1 drafted with portfolio, investor and office lines',
   $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(501), u(201), 400000, u(701))$$,
@@ -805,65 +941,75 @@ SELECT t_err('distribution: realization must belong to the batch''s deal', 'dist
   $$INSERT INTO distribution_batches (deal_id, amount, profit_realization_id) VALUES (u(201), 1, u(702))$$);
 SELECT t_err('distribution: batches start as draft', 'must be created as draft',
   $$INSERT INTO distribution_batches (deal_id, amount, profit_realization_id, status, approved_at) VALUES (u(201), 0, u(701), 'approved', now())$$);
-SELECT t_err('distribution: approval requires a journal entry', 'distribution_batches_approval_recorded',
-  $$UPDATE distribution_batches SET status = 'approved', approved_at = now() WHERE id = u(501)$$);
-SELECT t_err('distribution: lines must add up to the batch amount', 'does not equal batch amount',
+SELECT t_err_as(u(9999), 'distribution: approval requires a journal entry', 'distribution_batches_approval_recorded',
+  $$UPDATE distribution_batches SET status = 'approved' WHERE id = u(501)$$);
+SELECT t_ok('distribution: lines must add up to the batch amount [step 1 of 2: Accountant One] (setup)',
   $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(502), u(201), 5000, u(701))$$,
-  $$SELECT t_office(NULL, u(502), 4000)$$,
+  $$SELECT t_office(NULL, u(502), 4000)$$);
+SELECT t_err_as(u(9999), 'distribution: lines must add up to the batch amount', 'does not equal batch amount',
   $$SELECT t_approve_batch(u(502))$$);
-SELECT t_err('distribution: realization must be approved first', 'realization must be approved first',
+SELECT t_ok('distribution: realization must be approved first [step 1 of 2: Accountant One] (setup)',
   $$INSERT INTO lands (id, city, plan_number, land_number, purchase_price, status, acquired_on)
-    VALUES (u(108), 'Khobar', '77', '1', 200000, 'available', current_date)$$,
-  $$INSERT INTO deals (id, land_id, name, status) VALUES (u(206), u(108), 'Khobar 77/1', 'active')$$,
-  $$INSERT INTO funding_accounts (id, deal_id, investor_id) VALUES (u(308), u(206), u(3))$$,
-  $$SELECT t_move(NULL, u(308), 'contribution', 215000)$$,
-  $$SELECT t_purchase(u(206), u(108))$$,
-  $$SELECT t_sale(u(421), u(206), u(108), 300000, gen_random_uuid())$$,
-  $$SELECT t_realize(u(707), u(206), u(421))$$,
-  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(505), u(206), 100, u(707))$$,
-  $$SELECT t_office(NULL, u(505), 100)$$,
+    VALUES (u(160), 'Khobar', '79', '1', 200000, 'available', current_date)$$,
+  $$INSERT INTO deals (id, land_id, name, status) VALUES (u(260), u(160), 'Khobar 79/1', 'active')$$,
+  $$INSERT INTO funding_accounts (id, deal_id, investor_id) VALUES (u(360), u(260), u(3))$$,
+  $$SELECT t_move(NULL, u(360), 'contribution', 215000)$$,
+  $$SELECT t_purchase(u(260), u(160))$$,
+  $$SELECT t_sale(u(460), u(260), u(160), 300000, gen_random_uuid())$$,
+  $$SELECT t_realize(u(760), u(260), u(460))$$,
+  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(505), u(260), 100, u(760))$$,
+  $$SELECT t_office(NULL, u(505), 100)$$);
+SELECT t_err_as(u(9999), 'distribution: realization must be approved first', 'realization must be approved first',
   $$SELECT t_approve_batch(u(505))$$);
 SELECT t_err('distribution: no payouts against a draft batch', 'only made against an approved batch',
   $$SELECT t_payout(u(511), 100)$$);
-SELECT t_err('profit cap: cannot distribute more than distributable profit (60,000 > 46,875)', 'exceeds distributable profit',
-  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(506), u(201), 60000, u(701))$$,
-  $$SELECT t_line(NULL, u(506), u(303), 'portfolio', 0, 36000)$$,
-  $$SELECT t_line(NULL, u(506), u(304), 'investor', 0, 24000)$$,
-  $$SELECT t_approve_batch(u(506))$$);
-SELECT t_err('profit cap: cannot return more capital than the sale allows (400,000 > 337,500)', 'exceeds returnable capital',
-  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(506), u(201), 400000, u(701))$$,
-  $$SELECT t_line(NULL, u(506), u(303), 'portfolio', 240000, 0)$$,
-  $$SELECT t_line(NULL, u(506), u(304), 'investor', 160000, 0)$$,
-  $$SELECT t_approve_batch(u(506))$$);
-SELECT t_err('profit cap: cannot pay the office more than 25% (15,625.01 > 15,625)', 'exceeds the office fee',
-  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(506), u(201), 15625.01, u(701))$$,
-  $$SELECT t_office(NULL, u(506), 15625.01)$$,
-  $$SELECT t_approve_batch(u(506))$$);
-SELECT t_err('profit split: profit must follow ownership share (50/50 instead of 60/40)', 'ownership share',
-  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(506), u(201), 46875, u(701))$$,
-  $$SELECT t_line(NULL, u(506), u(303), 'portfolio', 0, 23437.50)$$,
-  $$SELECT t_line(NULL, u(506), u(304), 'investor', 0, 23437.50)$$,
-  $$SELECT t_approve_batch(u(506))$$);
-SELECT t_err('profit split: no holder can be left out', 'ownership share',
-  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(506), u(201), 46875, u(701))$$,
-  $$SELECT t_line(NULL, u(506), u(303), 'portfolio', 0, 46875)$$,
-  $$SELECT t_approve_batch(u(506))$$);
-SELECT t_ok('distribution: DB1 approved', $$SELECT t_approve_batch(u(501))$$);
+SELECT t_ok('profit cap: cannot distribute more than distributable profit (60,000 > 46,875) [step 1 of 2: Accountant One] (setup)',
+  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(5061), u(201), 60000, u(701))$$,
+  $$SELECT t_line(NULL, u(5061), u(303), 'portfolio', 0, 36000)$$,
+  $$SELECT t_line(NULL, u(5061), u(304), 'investor', 0, 24000)$$);
+SELECT t_err_as(u(9999), 'profit cap: cannot distribute more than distributable profit (60,000 > 46,875)', 'exceeds distributable profit',
+  $$SELECT t_approve_batch(u(5061))$$);
+SELECT t_ok('profit cap: cannot return more capital than the sale allows (400,000 > 337,500) [step 1 of 2: Accountant One] (setup)',
+  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(5062), u(201), 400000, u(701))$$,
+  $$SELECT t_line(NULL, u(5062), u(303), 'portfolio', 240000, 0)$$,
+  $$SELECT t_line(NULL, u(5062), u(304), 'investor', 160000, 0)$$);
+SELECT t_err_as(u(9999), 'profit cap: cannot return more capital than the sale allows (400,000 > 337,500)', 'exceeds returnable capital',
+  $$SELECT t_approve_batch(u(5062))$$);
+SELECT t_ok('profit cap: cannot pay the office more than 25% (15,625.01 > 15,625) [step 1 of 2: Accountant One] (setup)',
+  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(5063), u(201), 15625.01, u(701))$$,
+  $$SELECT t_office(NULL, u(5063), 15625.01)$$);
+SELECT t_err_as(u(9999), 'profit cap: cannot pay the office more than 25% (15,625.01 > 15,625)', 'exceeds the office fee',
+  $$SELECT t_approve_batch(u(5063))$$);
+SELECT t_ok('profit split: profit must follow ownership share (50/50 instead of 60/40) [step 1 of 2: Accountant One] (setup)',
+  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(5064), u(201), 46875, u(701))$$,
+  $$SELECT t_line(NULL, u(5064), u(303), 'portfolio', 0, 23437.50)$$,
+  $$SELECT t_line(NULL, u(5064), u(304), 'investor', 0, 23437.50)$$);
+SELECT t_err_as(u(9999), 'profit split: profit must follow ownership share (50/50 instead of 60/40)', 'ownership share',
+  $$SELECT t_approve_batch(u(5064))$$);
+SELECT t_ok('profit split: no holder can be left out [step 1 of 2: Accountant One] (setup)',
+  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(5065), u(201), 46875, u(701))$$,
+  $$SELECT t_line(NULL, u(5065), u(303), 'portfolio', 0, 46875)$$);
+SELECT t_err_as(u(9999), 'profit split: no holder can be left out', 'ownership share',
+  $$SELECT t_approve_batch(u(5065))$$);
+SELECT t_ok_as(u(9999), 'distribution: DB1 approved',
+  $$SELECT t_approve_batch(u(501))$$);
 SELECT t_err('distribution: lines frozen after approval', 'only be changed while the batch is a draft',
   $$SELECT t_office(NULL, u(501), 1)$$);
 SELECT t_err('distribution: approved batch cannot be edited', 'cannot be edited',
   $$UPDATE distribution_batches SET amount = 90000 WHERE id = u(501)$$);
 SELECT t_err('distribution: approved batch cannot return to draft', 'cannot change status',
   $$UPDATE distribution_batches SET status = 'draft' WHERE id = u(501)$$);
-SELECT t_err('profit cap: a second batch cannot push RA over its profit (46,876 > 46,875)', 'exceeds distributable profit',
-  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(508), u(201), 1, u(701))$$,
-  $$SELECT t_line(NULL, u(508), u(303), 'portfolio', 0, 0.60)$$,
-  $$SELECT t_line(NULL, u(508), u(304), 'investor', 0, 0.40)$$,
-  $$SELECT t_approve_batch(u(508))$$);
-SELECT t_err('office fee: a second batch cannot charge the same sale''s office fee again', 'exceeds the office fee',
-  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(508), u(201), 1, u(701))$$,
-  $$SELECT t_office(NULL, u(508), 1)$$,
-  $$SELECT t_approve_batch(u(508))$$);
+SELECT t_ok('profit cap: a second batch cannot push RA over its profit (46,876 > 46,875) [step 1 of 2: Accountant One] (setup)',
+  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(5081), u(201), 1, u(701))$$,
+  $$SELECT t_line(NULL, u(5081), u(303), 'portfolio', 0, 0.60)$$,
+  $$SELECT t_line(NULL, u(5081), u(304), 'investor', 0, 0.40)$$);
+SELECT t_err_as(u(9999), 'profit cap: a second batch cannot push RA over its profit (46,876 > 46,875)', 'exceeds distributable profit',
+  $$SELECT t_approve_batch(u(5081))$$);
+SELECT t_ok('office fee: a second batch cannot charge the same sale''s office fee again [step 1 of 2: Accountant One] (setup)',
+  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(5082), u(201), 1, u(701))$$,
+  $$SELECT t_office(NULL, u(5082), 1)$$);
+SELECT t_err_as(u(9999), 'office fee: a second batch cannot charge the same sale''s office fee again', 'exceeds the office fee',
+  $$SELECT t_approve_batch(u(5082))$$);
 SELECT t_err('journal amount: payout backed by a smaller cash payment rejected', 'pays 1.00 in cash but the payout is 100.00',
   $$SELECT t_entry(u(1158), u(25), u(21), 1)$$,
   $$INSERT INTO payouts (distribution_line_id, amount, paid_on, journal_entry_id) VALUES (u(513), 100, current_date, u(1158))$$);
@@ -872,16 +1018,16 @@ SELECT t_err('payout: cannot exceed the amount owed', 'would exceed',
 SELECT t_err('payout: split payouts cannot exceed the amount owed', 'would exceed',
   $$SELECT t_payout(u(511), 100000)$$,
   $$SELECT t_payout(u(511), 53750.01)$$);
-SELECT t_err('distribution: batch cannot be marked paid with unpaid lines', 'fully paid',
-  $$SELECT t_payout(u(511), 153750)$$,
-  $$UPDATE distribution_batches SET status = 'paid' WHERE id = u(501)$$);
-SELECT t_err('distribution: approved batch cannot be cancelled before reversing its entry', 'reverse its approval journal entry',
+SELECT t_err_as(u(9999), 'distribution: approved batch cannot be cancelled before reversing its entry', 'reverse its approval journal entry',
   $$UPDATE distribution_batches SET status = 'cancelled' WHERE id = u(501)$$);
-SELECT t_ok('distribution: all DB1 lines paid out, batch marked paid',
-  $$SELECT t_payout(u(511), 100000)$$,
-  $$SELECT t_payout(u(511), 53750)$$,
+SELECT t_ok('distribution: batch cannot be marked paid with unpaid lines [step 1 of 2: Accountant One] (setup)',
+  $$SELECT t_payout(u(511), 153750)$$);
+SELECT t_err_as(u(9999), 'distribution: batch cannot be marked paid with unpaid lines', 'fully paid',
+  $$UPDATE distribution_batches SET status = 'paid' WHERE id = u(501)$$);
+SELECT t_ok('distribution: all DB1 lines paid out, batch marked paid [step 1 of 2: Accountant One]',
   $$SELECT t_payout(u(512), 230625)$$,
-  $$SELECT t_payout(u(513), 15625)$$,
+  $$SELECT t_payout(u(513), 15625)$$);
+SELECT t_ok_as(u(9999), 'distribution: all DB1 lines paid out, batch marked paid [step 2 of 2: Admin One]',
   $$UPDATE distribution_batches SET status = 'paid' WHERE id = u(501)$$);
 SELECT t_err('payout: none after the batch is paid', 'only made against an approved batch',
   $$SELECT t_payout(u(513), 1)$$);
@@ -894,17 +1040,20 @@ SELECT t_err('payout: its journal entry cannot be reversed', 'compensating',
 SELECT t_true('distribution: P1 cash includes the 230,625 received from D1 (635,625)', $$portfolio_cash(u(11)) = 635625$$);
 
 -- Loss: D4 can return capital but no profit, and pays no office fee
-SELECT t_err('loss: no profit can be distributed from a loss-making sale', 'exceeds distributable profit',
-  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(509), u(204), 1, u(704))$$,
-  $$SELECT t_line(NULL, u(509), u(306), 'investor', 0, 1)$$,
-  $$SELECT t_approve_batch(u(509))$$);
-SELECT t_err('loss: no office fee on a loss-making sale', 'exceeds the office fee',
-  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(509), u(204), 1, u(704))$$,
-  $$SELECT t_office(NULL, u(509), 1)$$,
-  $$SELECT t_approve_batch(u(509))$$);
-SELECT t_ok('loss: the 450,000 sale proceeds returned to I2 as capital',
+SELECT t_ok('loss: no profit can be distributed from a loss-making sale [step 1 of 2: Accountant One] (setup)',
+  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(5091), u(204), 1, u(704))$$,
+  $$SELECT t_line(NULL, u(5091), u(306), 'investor', 0, 1)$$);
+SELECT t_err_as(u(9999), 'loss: no profit can be distributed from a loss-making sale', 'exceeds distributable profit',
+  $$SELECT t_approve_batch(u(5091))$$);
+SELECT t_ok('loss: no office fee on a loss-making sale [step 1 of 2: Accountant One] (setup)',
+  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(5092), u(204), 1, u(704))$$,
+  $$SELECT t_office(NULL, u(5092), 1)$$);
+SELECT t_err_as(u(9999), 'loss: no office fee on a loss-making sale', 'exceeds the office fee',
+  $$SELECT t_approve_batch(u(5092))$$);
+SELECT t_ok('loss: the 450,000 sale proceeds returned to I2 as capital [step 1 of 2: Accountant One]',
   $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(509), u(204), 450000, u(704))$$,
-  $$SELECT t_line(NULL, u(509), u(306), 'investor', 450000, 0)$$,
+  $$SELECT t_line(NULL, u(509), u(306), 'investor', 450000, 0)$$);
+SELECT t_ok_as(u(9999), 'loss: the 450,000 sale proceeds returned to I2 as capital [step 2 of 2: Admin One]',
   $$SELECT t_approve_batch(u(509))$$);
 
 -- Late investor: I4 joins D1 after its parcels were sold; RB1's profit (26,250) still belongs 60/40 to
@@ -913,17 +1062,19 @@ SELECT t_ok('timing: investor I4 joins D1 with 2,075,000 after all of D1''s sale
   $$INSERT INTO investors (id, full_name) VALUES (u(4), 'Late Investor')$$,
   $$INSERT INTO funding_accounts (id, deal_id, investor_id) VALUES (u(310), u(201), u(4))$$,
   $$SELECT t_move(NULL, u(310), 'contribution', 2075000)$$);
-SELECT t_err('timing: a late investor gets no share of an earlier sale''s profit', 'ownership share',
+SELECT t_ok('timing: a late investor gets no share of an earlier sale''s profit [step 1 of 2: Accountant One] (setup)',
   $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(541), u(201), 26250, u(708))$$,
   $$SELECT t_line(NULL, u(541), u(303), 'portfolio', 0, 7875)$$,
   $$SELECT t_line(NULL, u(541), u(304), 'investor', 0, 5250)$$,
-  $$SELECT t_line(NULL, u(541), u(310), 'investor', 0, 13125)$$,
+  $$SELECT t_line(NULL, u(541), u(310), 'investor', 0, 13125)$$);
+SELECT t_err_as(u(9999), 'timing: a late investor gets no share of an earlier sale''s profit', 'ownership share',
   $$SELECT t_approve_batch(u(541))$$);
-SELECT t_ok('timing: RB1 profit paid 60/40 to the holders at the time of the sale, with the 8,750 office fee',
+SELECT t_ok('timing: RB1 profit paid 60/40 to the holders at the time of the sale, with the 8,750 office fee [step 1 of 2: Accountant One]',
   $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(542), u(201), 35000, u(708))$$,
   $$SELECT t_line(NULL, u(542), u(303), 'portfolio', 0, 15750)$$,
   $$SELECT t_line(NULL, u(542), u(304), 'investor', 0, 10500)$$,
-  $$SELECT t_office(NULL, u(542), 8750)$$,
+  $$SELECT t_office(NULL, u(542), 8750)$$);
+SELECT t_ok_as(u(9999), 'timing: RB1 profit paid 60/40 to the holders at the time of the sale, with the 8,750 office fee [step 2 of 2: Admin One]',
   $$SELECT t_approve_batch(u(542))$$);
 
 -- ---------------------------------------------------------------------------
@@ -943,25 +1094,34 @@ SELECT t_err('portfolio distribution: a deal batch cannot have a source line', '
   $$INSERT INTO distribution_batches (deal_id, amount, profit_realization_id, source_line_id) VALUES (u(201), 1000, u(701), u(512))$$);
 SELECT t_err('portfolio distribution: cannot pass on more than the deal paid', 'deal paid the portfolio only',
   $$INSERT INTO distribution_batches (portfolio_id, amount, source_line_id) VALUES (u(11), 230625.01, u(512))$$);
-SELECT t_err('portfolio distribution: cannot pass on more profit than the deal paid (30,000 > 28,125)', 'passes on profit',
-  $$INSERT INTO distribution_batches (id, portfolio_id, amount, source_line_id) VALUES (u(503), u(11), 30000, u(512))$$,
-  $$SELECT t_line(NULL, u(503), u(301), 'investor', 0, 18000)$$,
-  $$SELECT t_line(NULL, u(503), u(302), 'investor', 0, 12000)$$,
-  $$SELECT t_approve_batch(u(503))$$);
-SELECT t_err('portfolio distribution: profit must follow members'' ownership share', 'ownership share',
-  $$INSERT INTO distribution_batches (id, portfolio_id, amount, source_line_id) VALUES (u(503), u(11), 28125, u(512))$$,
-  $$SELECT t_line(NULL, u(503), u(301), 'investor', 0, 28125)$$,
-  $$SELECT t_approve_batch(u(503))$$);
+SELECT t_ok('portfolio distribution: cannot pass on more profit than the deal paid (30,000 > 28,125) [step 1 of 2: Accountant One] (setup)',
+  $$INSERT INTO distribution_batches (id, portfolio_id, amount, source_line_id) VALUES (u(5031), u(11), 30000, u(512))$$,
+  $$SELECT t_line(NULL, u(5031), u(301), 'investor', 0, 18000)$$,
+  $$SELECT t_line(NULL, u(5031), u(302), 'investor', 0, 12000)$$);
+SELECT t_err_as(u(9999), 'portfolio distribution: cannot pass on more profit than the deal paid (30,000 > 28,125)', 'passes on profit',
+  $$SELECT t_approve_batch(u(5031))$$);
+SELECT t_ok('portfolio distribution: the rejected draft batch is discarded',
+  $$DELETE FROM distribution_lines WHERE batch_id = u(5031)$$, $$DELETE FROM distribution_batches WHERE id = u(5031)$$);
+SELECT t_ok('portfolio distribution: profit must follow members'' ownership share [step 1 of 2: Accountant One] (setup)',
+  $$INSERT INTO distribution_batches (id, portfolio_id, amount, source_line_id) VALUES (u(5032), u(11), 28125, u(512))$$,
+  $$SELECT t_line(NULL, u(5032), u(301), 'investor', 0, 28125)$$);
+SELECT t_err_as(u(9999), 'portfolio distribution: profit must follow members'' ownership share', 'ownership share',
+  $$SELECT t_approve_batch(u(5032))$$);
+SELECT t_ok('portfolio distribution: the rejected draft batch is discarded',
+  $$DELETE FROM distribution_lines WHERE batch_id = u(5032)$$, $$DELETE FROM distribution_batches WHERE id = u(5032)$$);
 SELECT t_err('portfolio distribution: cannot pay an investor outside the portfolio', 'distribution_lines_account_scope_fk',
   $$INSERT INTO distribution_batches (id, portfolio_id, amount, source_line_id) VALUES (u(504), u(11), 1000, u(512))$$,
   $$SELECT t_line(NULL, u(504), u(304), 'investor', 0, 1000)$$);
-SELECT t_ok('portfolio distribution: P1 passes 230,625 on to I1 and I2 by ownership share, paid in full',
+SELECT t_ok('portfolio distribution: P1 passes 230,625 on to I1 and I2 by ownership share, paid in full [step 1 of 4: Accountant One]',
   $$INSERT INTO distribution_batches (id, portfolio_id, amount, source_line_id) VALUES (u(503), u(11), 230625, u(512))$$,
   $$SELECT t_line(u(521), u(503), u(301), 'investor', 121500, 16875)$$,
-  $$SELECT t_line(u(522), u(503), u(302), 'investor', 81000, 11250)$$,
-  $$SELECT t_approve_batch(u(503))$$,
+  $$SELECT t_line(u(522), u(503), u(302), 'investor', 81000, 11250)$$);
+SELECT t_ok_as(u(9999), 'portfolio distribution: P1 passes 230,625 on to I1 and I2 by ownership share, paid in full [step 2 of 4: Admin One]',
+  $$SELECT t_approve_batch(u(503))$$);
+SELECT t_ok('portfolio distribution: P1 passes 230,625 on to I1 and I2 by ownership share, paid in full [step 3 of 4: Accountant One]',
   $$SELECT t_payout(u(521), 138375)$$,
-  $$SELECT t_payout(u(522), 92250)$$,
+  $$SELECT t_payout(u(522), 92250)$$);
+SELECT t_ok_as(u(9999), 'portfolio distribution: P1 passes 230,625 on to I1 and I2 by ownership share, paid in full [step 4 of 4: Admin One]',
   $$UPDATE distribution_batches SET status = 'paid' WHERE id = u(503)$$);
 SELECT t_true('portfolio distribution: P1 cash back to 405,000 after passing the payout on', $$portfolio_cash(u(11)) = 405000$$);
 SELECT t_true('office fee: charged once for parcel A (15,625) even though the deal was portfolio-funded',
@@ -972,10 +1132,439 @@ SELECT t_err('portfolio distribution: a second batch from the same source would 
   $$INSERT INTO distribution_batches (portfolio_id, amount, source_line_id) VALUES (u(11), 1, u(512))$$);
 
 -- ---------------------------------------------------------------------------
+-- Acting employee
+-- ---------------------------------------------------------------------------
+SELECT t_err_nobody('acting: writes are rejected when no employee is acting', 'no acting employee',
+  $$INSERT INTO investors (full_name) VALUES ('Nobody')$$);
+SELECT t_err('acting: an unknown session token is refused', 'invalid, expired or revoked session',
+  $$SELECT erp_act_as('not-a-real-session-token-0000000000000000')$$);
+SELECT t_err('acting: an employee id is not a session token', 'invalid, expired or revoked session',
+  $$SELECT erp_act_as(u(9999)::text)$$);
+SELECT t_err('acting: a disabled employee''s still-open session is refused', 'is disabled',
+  $$SELECT erp_act_as(t_tok(u(9006)))$$);
+
+-- ---------------------------------------------------------------------------
+-- Role permissions
+-- ---------------------------------------------------------------------------
+SELECT t_ok_as(u(9003), 'viewer: can read',
+  $$SELECT count(*) FROM lands$$);
+SELECT t_err_as(u(9003), 'viewer: cannot create an investor', 'permission denied: editing investors requires role',
+  $$INSERT INTO investors (full_name) VALUES ('V')$$);
+SELECT t_err_as(u(9003), 'viewer: cannot edit a land', 'permission denied: editing lands requires role',
+  $$UPDATE lands SET street_width_m = 20 WHERE id = u(103)$$);
+SELECT t_ok_as(u(9002), 'data entry: can create investors and lands and draft a journal entry',
+  $$INSERT INTO investors (id, full_name) VALUES (u(20), 'Investor Twenty');
+      INSERT INTO lands (city, plan_number, land_number) VALUES ('Riyadh', '4444', '1');
+      INSERT INTO journal_entries (id, occurred_on, description) VALUES (u(1400), current_date, 'drafted by data entry');
+      INSERT INTO journal_lines (journal_entry_id, ledger_account_id, debit) VALUES (u(1400), u(21), 500);
+      INSERT INTO journal_lines (journal_entry_id, ledger_account_id, credit) VALUES (u(1400), u(23), 500)$$);
+SELECT t_err_as(u(9002), 'data entry: cannot post a journal entry', 'posting a journal entry requires role admin or accountant',
+  $$UPDATE journal_entries SET status = 'posted' WHERE id = u(1400)$$);
+SELECT t_ok('accountant: posts the entry drafted by data entry',
+  $$UPDATE journal_entries SET status = 'posted' WHERE id = u(1400)$$);
+SELECT t_true('accountant: the database records who posted it and when',
+  $$(SELECT approved_by = u(9001) AND posted_at IS NOT NULL AND created_by = u(9002) FROM journal_entries WHERE id = u(1400))$$);
+SELECT t_err_as(u(9002), 'data entry: cannot record capital movements', 'recording capital_movements requires role admin or accountant',
+  $$INSERT INTO capital_movements (funding_account_id, kind, amount, effective_on, journal_entry_id) VALUES (u(302), 'contribution', 1, current_date, u(1400))$$);
+SELECT t_err_as(u(9002), 'data entry: cannot create ledger accounts', 'recording ledger_accounts requires role admin or accountant',
+  $$INSERT INTO ledger_accounts (code, name, account_type) VALUES ('9999', 'X', 'asset')$$);
+SELECT t_err_as(u(9002), 'data entry: cannot record a sale', 'recording deal_sales requires role admin or accountant',
+  $$INSERT INTO deal_sales (deal_id, land_id, sale_amount, sold_on, buyer_name, payment_reference, journal_entry_id) VALUES (u(201), u(111), 1, current_date, 'B', 'R', u(1400))$$);
+SELECT t_err('accountant: cannot approve a profit realization', 'approving a profit realization requires role admin',
+  $$SELECT t_close(u(790), u(201))$$,
+  $$UPDATE profit_realizations SET status = 'approved' WHERE id = u(790)$$);
+SELECT t_err('accountant: cannot settle a deal', 'settling a deal requires role admin',
+  $$UPDATE deals SET status = 'settled' WHERE id = u(201)$$);
+SELECT t_err('accountant: cannot close a portfolio', 'closing a portfolio requires role admin',
+  $$UPDATE portfolios SET status = 'closed' WHERE id = u(11)$$);
+SELECT t_err('accountant: cannot manage employees', 'managing employees requires role admin',
+  $$INSERT INTO app_users (full_name, email, role) VALUES ('X', 'x@office.test', 'viewer')$$);
+SELECT t_err('accountant: cannot manage cities', 'managing cities requires role admin',
+  $$INSERT INTO cities (code, name_ar, name_en) VALUES ('jazan', 'جازان', 'Jazan')$$);
+
+-- ---------------------------------------------------------------------------
+-- Four-eyes rule (no exceptions, including admins)
+-- ---------------------------------------------------------------------------
+SELECT t_ok('four-eyes: Accountant One drafts an entry; Accountant Two adds a line [step 1 of 2: Accountant One]',
+  $$INSERT INTO journal_entries (id, occurred_on, description) VALUES (u(1420), current_date, 'two preparers')$$,
+  $$INSERT INTO journal_lines (journal_entry_id, ledger_account_id, debit) VALUES (u(1420), u(21), 100)$$);
+SELECT t_ok_as(u(9005), 'four-eyes: Accountant One drafts an entry; Accountant Two adds a line [step 2 of 2: Accountant Two]',
+  $$INSERT INTO journal_lines (journal_entry_id, ledger_account_id, credit) VALUES (u(1420), u(23), 100)$$);
+SELECT t_err('four-eyes: the entry''s preparer cannot post it', 'four-eyes rule',
+  $$UPDATE journal_entries SET status = 'posted' WHERE id = u(1420)$$);
+SELECT t_err_as(u(9005), 'four-eyes: an employee who added a line cannot post it', 'four-eyes rule',
+  $$UPDATE journal_entries SET status = 'posted' WHERE id = u(1420)$$);
+SELECT t_true('four-eyes: the entry stays pending (draft) until an eligible employee posts it',
+  $$(SELECT status FROM journal_entries WHERE id = u(1420)) = 'draft'$$);
+SELECT t_ok_as(u(9999), 'four-eyes: a third employee posts it',
+  $$UPDATE journal_entries SET status = 'posted' WHERE id = u(1420)$$);
+SELECT t_err_as(u(9999), 'four-eyes: an admin cannot post an entry they prepared', 'four-eyes rule',
+  $$INSERT INTO journal_entries (id, occurred_on, description) VALUES (u(1421), current_date, 'admin self-post');
+      INSERT INTO journal_lines (journal_entry_id, ledger_account_id, debit) VALUES (u(1421), u(21), 10);
+      INSERT INTO journal_lines (journal_entry_id, ledger_account_id, credit) VALUES (u(1421), u(23), 10);
+      UPDATE journal_entries SET status = 'posted' WHERE id = u(1421)$$);
+SELECT t_err_as(u(9999), 'four-eyes: an admin cannot approve a profit realization they prepared', 'four-eyes rule',
+  $$SELECT t_close(u(790), u(201)); UPDATE profit_realizations SET status = 'approved' WHERE id = u(790)$$);
+SELECT t_ok('four-eyes: Accountant One prepares a distribution of RB2''s office fee; Admin One adds the fee line [step 1 of 2: Accountant One]',
+  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(560), u(201), 11250, u(709))$$);
+SELECT t_ok_as(u(9999), 'four-eyes: Accountant One prepares a distribution of RB2''s office fee; Admin One adds the fee line [step 2 of 2: Admin One]',
+  $$SELECT t_office(u(561), u(560), 11250)$$);
+SELECT t_err('four-eyes: an accountant cannot approve a distribution', 'approve a distribution requires role admin',
+  $$SELECT t_entry(u(1410), u(24), u(25), 11250)$$,
+  $$UPDATE distribution_batches SET status = 'approved', journal_entry_id = u(1410) WHERE id = u(560)$$);
+SELECT t_ok('four-eyes: an admin who added a line cannot approve the distribution [step 1 of 2: Accountant One] (setup)',
+  $$SELECT t_entry(u(1410), u(24), u(25), 11250)$$);
+SELECT t_err_as(u(9999), 'four-eyes: an admin who added a line cannot approve the distribution', 'four-eyes rule',
+  $$UPDATE distribution_batches SET status = 'approved', journal_entry_id = u(1410) WHERE id = u(560)$$);
+SELECT t_ok('four-eyes: the other admin approves it [step 1 of 2: Accountant One]',
+  $$SELECT t_entry(u(1411), u(24), u(25), 11250)$$);
+SELECT t_ok_as(u(9004), 'four-eyes: the other admin approves it [step 2 of 2: Admin Two]',
+  $$UPDATE distribution_batches SET status = 'approved', journal_entry_id = u(1411) WHERE id = u(560)$$);
+SELECT t_true('four-eyes: approval recorded with the approving admin and time',
+  $$(SELECT approved_by = u(9004) AND approved_at IS NOT NULL FROM distribution_batches WHERE id = u(560))$$);
+SELECT t_ok('four-eyes: office fee paid out', $$SELECT t_payout(u(561), 11250)$$);
+SELECT t_err_as(u(9999), 'four-eyes: an admin who prepared part of the distribution cannot mark it paid', 'four-eyes rule',
+  $$UPDATE distribution_batches SET status = 'paid' WHERE id = u(560)$$);
+SELECT t_ok_as(u(9004), 'four-eyes: the other admin marks it paid',
+  $$UPDATE distribution_batches SET status = 'paid' WHERE id = u(560)$$);
+SELECT t_true('four-eyes: payment recorded with the admin and time',
+  $$(SELECT paid_by = u(9004) AND paid_at IS NOT NULL FROM distribution_batches WHERE id = u(560))$$);
+SELECT t_err_as(u(9999), 'four-eyes: an admin cannot settle a deal they created', 'four-eyes rule',
+  $$INSERT INTO lands (id, city, plan_number, land_number) VALUES (u(195), 'Taif', '50', '5');
+      INSERT INTO deals (id, land_id, name) VALUES (u(295), u(195), 'admin deal');
+      UPDATE deals SET status = 'settled' WHERE id = u(295)$$);
+SELECT t_err_as(u(9999), 'four-eyes: an admin cannot close a portfolio they created', 'four-eyes rule',
+  $$INSERT INTO portfolios (id, name) VALUES (u(13), 'Admin Portfolio');
+      UPDATE portfolios SET status = 'closed' WHERE id = u(13)$$);
+
+-- ---------------------------------------------------------------------------
+-- Employee management
+-- ---------------------------------------------------------------------------
+SELECT t_ok_as(u(9999), 'employees: an admin adds an employee',
+  $$INSERT INTO app_users (id, full_name, email, role) VALUES (u(9007), 'New Clerk', 'new.clerk@office.test', 'data_entry')$$);
+SELECT t_err_as(u(9999), 'employees: emails are unique', 'app_users_email_uq',
+  $$INSERT INTO app_users (full_name, email, role) VALUES ('Copy', 'new.clerk@office.test', 'viewer')$$);
+SELECT t_err_as(u(9999), 'employees: only the four roles exist', 'app_users_role_check',
+  $$INSERT INTO app_users (full_name, email, role) VALUES ('M', 'm@office.test', 'manager')$$);
+SELECT t_ok_as(u(9999), 'employees: an admin changes an employee''s role',
+  $$UPDATE app_users SET role = 'accountant' WHERE id = u(9007)$$);
+SELECT t_true('employees: role change audited with old and new role and the admin',
+  $$EXISTS (SELECT 1 FROM audit_events WHERE entity_type = 'app_users' AND entity_id = u(9007)::text AND action = 'role_change'
+              AND actor_id = u(9999) AND old_values->>'role' = 'data_entry' AND new_values->>'role' = 'accountant')$$);
+SELECT t_err_as(u(9999), 'employees: nobody can change their own role', 'cannot change their own role',
+  $$UPDATE app_users SET role = 'viewer' WHERE id = u(9999)$$);
+SELECT t_err_as(u(9999), 'employees: cannot be deleted (disable instead)', 'cannot be deleted',
+  $$DELETE FROM app_users WHERE id = u(9007)$$);
+SELECT t_err_as(u(9999), 'employees: the system user cannot be changed', 'system user cannot be changed',
+  $$UPDATE app_users SET role = 'admin' WHERE id = erp_system_user_id()$$);
+SELECT t_err_as(u(9999), 'employees: no further system users', 'system users cannot be created',
+  $$INSERT INTO app_users (full_name, role, is_system) VALUES ('Bot', 'admin', true)$$);
+SELECT t_ok('employees: the login service opens a session for the new employee',
+  $$SET LOCAL ROLE postgres$$, $$SELECT erp_open_session(u(9007), t_tok(u(9007)))$$);
+SELECT t_ok_as(u(9999), 'employees: an admin disables an employee',
+  $$UPDATE app_users SET status = 'disabled' WHERE id = u(9007)$$);
+SELECT t_err('employees: the disabled employee can no longer act, even with an open session', 'is disabled',
+  $$SELECT erp_act_as(t_tok(u(9007)))$$);
+
+-- ---------------------------------------------------------------------------
+-- Login credentials (groundwork for secure authentication)
+-- ---------------------------------------------------------------------------
+SELECT t_err('credentials: the application role cannot read them', 'permission denied for table user_credentials',
+  $$SELECT count(*) FROM user_credentials$$);
+SELECT t_ok_as(u(9999), 'credentials: the login service sets an Argon2id hash for an employee (admin)',
+  $$SET LOCAL ROLE erp_auth$$,
+  $$INSERT INTO user_credentials (user_id, password_hash) VALUES (u(9001), '$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$aGFzaGhhc2g')$$);
+SELECT t_ok_as(u(9005), 'credentials: an employee sets their own',
+  $$SET LOCAL ROLE erp_auth$$,
+  $$INSERT INTO user_credentials (user_id, password_hash) VALUES (u(9005), '$argon2id$v=19$m=65536,t=3,p=4$b3RoZXJzYWx0$b3RoZXJoYXNo')$$);
+SELECT t_err_as(u(9999), 'credentials: only Argon2id hashes are accepted (never a plain password)', 'user_credentials_password_hash_check',
+  $$SET LOCAL ROLE erp_auth$$,
+  $$INSERT INTO user_credentials (user_id, password_hash) VALUES (u(9002), 'Password123')$$);
+SELECT t_err('credentials: an accountant cannot set another employee''s credentials', 'requires role admin',
+  $$SET LOCAL ROLE erp_auth$$,
+  $$INSERT INTO user_credentials (user_id, password_hash) VALUES (u(9002), '$argon2id$v=19$m=65536,t=3,p=4$eA$eA')$$);
+SELECT t_err_as(u(9999), 'credentials: the system user can never log in', 'can never have login credentials',
+  $$SET LOCAL ROLE erp_auth$$,
+  $$INSERT INTO user_credentials (user_id, password_hash) VALUES (erp_system_user_id(), '$argon2id$v=19$m=65536,t=3,p=4$eA$eA')$$);
+SELECT t_true('credentials: audited without the password hash',
+  $$(SELECT count(*) = 2 AND bool_and(action = 'credential_create' AND NOT (new_values ? 'password_hash'))
+       FROM audit_events WHERE entity_type = 'user_credentials')$$);
+
+-- ---------------------------------------------------------------------------
+-- Database role hardening
+-- ---------------------------------------------------------------------------
+SELECT t_err('database: the application role cannot disable triggers', 'must be owner',
+  $$ALTER TABLE lands DISABLE TRIGGER aa_authorize$$);
+SELECT t_err('database: the application role cannot write audit records directly', 'permission denied for table audit_events',
+  $$INSERT INTO audit_events (entity_type, entity_id, action) VALUES ('x', 'x', 'forged')$$);
+SELECT t_err('database: the application role cannot edit audit records', 'permission denied for table audit_events',
+  $$UPDATE audit_events SET action = 'forged'$$);
+SELECT t_err('database: even the owner cannot edit audit records', 'append-only',
+  $$RESET ROLE$$, $$UPDATE audit_events SET action = 'forged'$$);
+SELECT t_err('database: even the owner cannot delete audit records', 'append-only',
+  $$RESET ROLE$$, $$DELETE FROM audit_events$$);
+SELECT t_err('database: even the owner cannot truncate the audit trail', 'append-only',
+  $$RESET ROLE$$, $$TRUNCATE audit_events$$);
+SELECT t_err('database: the application role cannot create the first admin', 'permission denied for function erp_bootstrap_admin',
+  $$SELECT erp_bootstrap_admin('Intruder', 'intruder@office.test')$$);
+SELECT t_err('database: the first-admin setup refuses once an admin exists', 'an admin already exists',
+  $$RESET ROLE$$, $$SELECT erp_bootstrap_admin('Second', 'second@office.test')$$);
+SELECT t_err('database: the reporting role is read only', 'permission denied for table investors',
+  $$SET LOCAL ROLE erp_readonly$$, $$INSERT INTO investors (full_name) VALUES ('R')$$);
+
+-- ---------------------------------------------------------------------------
+-- Security regression tests (each replays an attack found in the security review)
+-- A1: internal switches cannot be set by the application
+-- ---------------------------------------------------------------------------
+SELECT t_err_as(u(9003), 'A1 regression: a Viewer cannot create an admin through the old first-admin switch', 'managing employees requires role admin',
+  $$SELECT set_config('erp.bootstrap', 'on', true)$$,
+  $$INSERT INTO app_users (full_name, email, role) VALUES ('Spoof', 'spoof@office.test', 'admin')$$);
+SELECT t_err('A1 regression: an expense allocation cannot be forged through the old allocation switch', 'allocations are made automatically',
+  $$SELECT set_config('erp.allocating', 'on', true)$$,
+  $$INSERT INTO realization_costs (realization_id, deal_id, deal_cost_id, amount) VALUES (u(709), u(201), u(901), 1)$$);
+SELECT t_err_as(u(9002), 'A1 regression: Data Entry cannot mark an unsold land sold through the old status switch', 'set automatically',
+  $$SELECT set_config('erp.land_status_sync', 'on', true)$$,
+  $$UPDATE lands SET status = 'sold' WHERE id = u(103)$$);
+SELECT t_err('A1 regression: the application cannot run the first-admin setup at all', 'permission denied for function erp_bootstrap_admin',
+  $$SELECT erp_bootstrap_admin('Intruder', 'intruder@office.test')$$);
+
+-- A2: employee identity comes only from a verified session
+SELECT t_err_nobody('A2 regression: naming an employee with set_config is ignored', 'no acting employee',
+  $$SELECT set_config('erp.user_id', u(9999)::text, true)$$,
+  $$INSERT INTO app_users (full_name, email, role) VALUES ('Spoof', 'spoof2@office.test', 'admin')$$);
+SELECT t_err_as(u(9003), 'A2 regression: a Viewer session cannot claim to be Admin One', 'managing employees requires role admin',
+  $$SELECT set_config('erp.user_id', u(9999)::text, true);
+      INSERT INTO app_users (full_name, email, role) VALUES ('Spoof', 'spoof3@office.test', 'admin')$$);
+SELECT t_err('A2 regression: the application cannot write the verified-identity table', 'permission denied for table acting_context',
+  $$INSERT INTO acting_context (backend_pid, xact_id, user_id) VALUES (pg_backend_pid(), txid_current(), u(9999))
+    ON CONFLICT (backend_pid) DO UPDATE SET user_id = u(9999)$$);
+SELECT t_err('A2 regression: the application cannot read sessions', 'permission denied for table user_sessions',
+  $$SELECT count(*) FROM user_sessions$$);
+SELECT t_err('A2 regression: the application cannot open sessions', 'permission denied for function erp_open_session',
+  $$SELECT erp_open_session(u(9999), repeat('x', 40))$$);
+SELECT t_err('A2 regression: the application cannot act as the system user', 'permission denied for function erp_act_as_system',
+  $$SELECT erp_act_as_system()$$);
+SELECT t_ok('A2: sessions store only the SHA-256 hash of the token, never the token',
+  $$SET LOCAL ROLE erp_auth$$,
+  $$DO $x$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM user_sessions WHERE token_hash = digest(t_tok(u(9001)), 'sha256'))
+         OR EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'user_sessions' AND column_name = 'token') THEN
+        RAISE EXCEPTION 'session tokens are not stored as hashes only';
+      END IF;
+    END $x$ $$);
+SELECT t_err('A2: session tokens must be long random values', 'at least 32 characters',
+  $$SET LOCAL ROLE erp_auth$$, $$SELECT erp_open_session(u(9005), 'short')$$);
+SELECT t_err('A2: no session can be opened for the system user', 'never the system user',
+  $$SET LOCAL ROLE erp_auth$$, $$SELECT erp_open_session(erp_system_user_id(), repeat('s', 40))$$);
+SELECT t_err('A2: no session can be opened for a disabled employee', 'is disabled',
+  $$SET LOCAL ROLE erp_auth$$, $$SELECT erp_open_session(u(9006), repeat('d', 40))$$);
+SELECT t_err('A2: an expired session is refused', 'invalid, expired or revoked session',
+  $$SET LOCAL ROLE postgres$$,
+  $$SELECT erp_open_session(u(9005), 'expiring-session-token-0000000000000000')$$,
+  $$UPDATE user_sessions SET created_at = now() - interval '2 hours', expires_at = now() - interval '1 hour'
+     WHERE token_hash = digest('expiring-session-token-0000000000000000', 'sha256')$$,
+  $$SET LOCAL ROLE erp_app$$,
+  $$SELECT erp_act_as('expiring-session-token-0000000000000000')$$);
+SELECT t_err('A2: a revoked session is refused', 'invalid, expired or revoked session',
+  $$SET LOCAL ROLE erp_auth$$,
+  $$SELECT erp_revoke_session(erp_open_session(u(9005), 'revoked-session-token-00000000000000000'))$$,
+  $$SET LOCAL ROLE erp_app$$,
+  $$SELECT erp_act_as('revoked-session-token-00000000000000000')$$);
+SELECT t_ok_nobody('A2: an employee logs out',
+  $$SET LOCAL ROLE erp_auth$$, $$SELECT erp_open_session(u(9005), 'logout-session-token-000000000000000000')$$,
+  $$SET LOCAL ROLE erp_app$$, $$SELECT erp_act_as('logout-session-token-000000000000000000')$$, $$SELECT erp_end_session()$$);
+SELECT t_err('A2: a logged-out session can no longer be used', 'invalid, expired or revoked session',
+  $$SELECT erp_act_as('logout-session-token-000000000000000000')$$);
+
+-- A3: the four-eyes rule cannot be bypassed by claiming a second identity
+SELECT t_err_as(u(9999), 'A3 regression: an admin cannot post their own entry by claiming to be the other admin', 'four-eyes rule',
+  $$INSERT INTO journal_entries (id, occurred_on, description) VALUES (u(1440), current_date, 'self via spoof');
+      INSERT INTO journal_lines (journal_entry_id, ledger_account_id, debit) VALUES (u(1440), u(21), 7);
+      INSERT INTO journal_lines (journal_entry_id, ledger_account_id, credit) VALUES (u(1440), u(23), 7);
+      SELECT set_config('erp.user_id', u(9004)::text, true);
+      UPDATE journal_entries SET status = 'posted' WHERE id = u(1440)$$);
+SELECT t_err('A3 regression: switching to another employee requires their own session token', 'invalid, expired or revoked session',
+  $$SELECT erp_act_as(u(9004)::text)$$);
+SELECT t_ok('A3 regression: the audit trail names the verified employee, whatever the session claims',
+  $$SELECT set_config('erp.user_id', u(9002)::text, true)$$,
+  $$UPDATE investors SET contact_phone = '0533333333' WHERE id = u(1)$$);
+SELECT t_true('A3 regression: that change is audited as Accountant One, not the claimed Data Entry One',
+  $$(SELECT actor_id FROM audit_events WHERE entity_type = 'investors' AND entity_id = u(1)::text
+      ORDER BY occurred_at DESC LIMIT 1) = u(9001)$$);
+
+-- A3b: one employee per transaction, even when both employees have valid session tokens
+SELECT t_err('A3b regression: switching to another employee mid-transaction is refused, even with their valid token', 'one employee per transaction',
+  $$SELECT erp_act_as(t_tok(u(9005)))$$);
+SELECT t_err('A3b regression: one transaction cannot prepare and post the same entry with two valid tokens', 'one employee per transaction',
+  $$INSERT INTO journal_entries (id, occurred_on, description) VALUES (u(1460), current_date, 'prepare then switch')$$,
+  $$INSERT INTO journal_lines (journal_entry_id, ledger_account_id, debit) VALUES (u(1460), u(21), 3)$$,
+  $$INSERT INTO journal_lines (journal_entry_id, ledger_account_id, credit) VALUES (u(1460), u(23), 3)$$,
+  $$SELECT erp_act_as(t_tok(u(9005)))$$,
+  $$UPDATE journal_entries SET status = 'posted' WHERE id = u(1460)$$);
+SELECT t_err_as(u(9999), 'A3b regression: one transaction cannot prepare and approve a profit realization with two admins'' valid tokens', 'one employee per transaction',
+  $$SELECT t_close(u(791), u(201))$$,
+  $$SELECT erp_act_as(t_tok(u(9004)))$$,
+  $$UPDATE profit_realizations SET status = 'approved' WHERE id = u(791)$$);
+SELECT t_err('A3b regression: one transaction cannot prepare a distribution and approve it as an admin', 'one employee per transaction',
+  $$INSERT INTO distribution_batches (id, deal_id, amount, profit_realization_id) VALUES (u(570), u(201), 1, u(709))$$,
+  $$SELECT t_office(NULL, u(570), 1)$$,
+  $$SELECT erp_act_as(t_tok(u(9999)))$$);
+SELECT t_err('A3b regression: the system user cannot be switched to mid-transaction either', 'one employee per transaction',
+  $$RESET ROLE$$, $$SELECT erp_act_as_system()$$);
+SELECT t_ok('A3b: naming the same employee again in the same transaction is fine',
+  $$SELECT erp_act_as(t_tok(u(9001)))$$, $$SELECT erp_act_as(t_tok(u(9001)))$$);
+
+-- A4: identity never carries over into the next transaction on a pooled connection
+SELECT erp_act_as(t_tok(u(9999)));
+SELECT t_err_nobody('A4 regression: an identity set in one transaction is gone in the next', 'no acting employee',
+  $$INSERT INTO investors (full_name) VALUES ('Leaked')$$);
+SELECT set_config('erp.user_id', u(9999)::text, false);
+SELECT t_err_nobody('A4 regression: a connection-wide setting does not make anyone the acting employee', 'no acting employee',
+  $$INSERT INTO investors (full_name) VALUES ('Leaked')$$);
+RESET erp.user_id;
+
+-- ---------------------------------------------------------------------------
+-- B1: master data is soft-deleted (deactivated), never deleted
+-- ---------------------------------------------------------------------------
+SELECT t_err_as(u(9002), 'B1 regression: investors are never deleted', 'investors records are never deleted',
+  $$DELETE FROM investors WHERE id = u(20)$$);
+SELECT t_err('B1: lands are never deleted', 'lands records are never deleted', $$DELETE FROM lands WHERE id = u(103)$$);
+SELECT t_err('B1: portfolios are never deleted', 'portfolios records are never deleted', $$DELETE FROM portfolios WHERE id = u(12)$$);
+SELECT t_err('B1: ledger accounts are never deleted', 'ledger_accounts records are never deleted', $$DELETE FROM ledger_accounts WHERE id = u(26)$$);
+SELECT t_err('B1: deals are never deleted', 'deals records are never deleted', $$DELETE FROM deals WHERE id = u(204)$$);
+SELECT t_err('B1: funding accounts are never deleted', 'funding_accounts records are never deleted', $$DELETE FROM funding_accounts WHERE id = u(307)$$);
+SELECT t_err_as(u(9999), 'B1: city spellings are never deleted, even by an admin', 'city_aliases records are never deleted',
+  $$DELETE FROM city_aliases WHERE alias = 'jedda'$$);
+SELECT t_ok('B1: an investor is deactivated instead', $$UPDATE investors SET is_active = false WHERE id = u(20)$$);
+SELECT t_true('B1: deactivation records who and when, and is audited',
+  $$(SELECT NOT is_active AND deactivated_by = u(9001) AND deactivated_at IS NOT NULL FROM investors WHERE id = u(20))
+    AND EXISTS (SELECT 1 FROM audit_events WHERE entity_type = 'investors' AND entity_id = u(20)::text
+                  AND action = 'deactivate' AND actor_id = u(9001))$$);
+SELECT t_err('B1: an inactive investor cannot join a portfolio', 'investor ' || u(20) || ' is inactive',
+  $$INSERT INTO funding_accounts (portfolio_id, investor_id) VALUES (u(11), u(20))$$);
+SELECT t_ok('B1: the investor is reactivated', $$UPDATE investors SET is_active = true WHERE id = u(20)$$);
+SELECT t_true('B1: reactivation clears the deactivation stamps and is audited',
+  $$(SELECT is_active AND deactivated_by IS NULL AND deactivated_at IS NULL FROM investors WHERE id = u(20))
+    AND EXISTS (SELECT 1 FROM audit_events WHERE entity_type = 'investors' AND entity_id = u(20)::text AND action = 'reactivate')$$);
+SELECT t_ok('B1: a ledger account is deactivated',
+  $$INSERT INTO ledger_accounts (id, code, name, account_type) VALUES (u(28), '5900', 'Old expenses', 'expense')$$,
+  $$UPDATE ledger_accounts SET is_active = false WHERE id = u(28)$$);
+SELECT t_err('B1: an inactive ledger account cannot be used in new journal lines', 'ledger account ' || u(28) || ' is inactive',
+  $$INSERT INTO journal_entries (id, occurred_on, description) VALUES (u(1450), current_date, 'old account')$$,
+  $$INSERT INTO journal_lines (journal_entry_id, ledger_account_id, debit) VALUES (u(1450), u(28), 1)$$);
+SELECT t_err_as(u(9002), 'B1: Data Entry cannot deactivate ledger accounts', 'requires role admin or accountant',
+  $$UPDATE ledger_accounts SET is_active = false WHERE id = u(26)$$);
+SELECT t_ok('B1: a land is deactivated',
+  $$INSERT INTO lands (id, city, plan_number, land_number, purchase_price, status, acquired_on)
+    VALUES (u(196), 'Abha', '61', '9', 100000, 'available', current_date)$$,
+  $$UPDATE lands SET is_active = false WHERE id = u(196)$$);
+SELECT t_err('B1: an inactive land cannot get a new deal', 'land ' || u(196) || ' is inactive',
+  $$INSERT INTO deals (land_id, name) VALUES (u(196), 'inactive land deal')$$);
+SELECT t_err('B1: an inactive land cannot be subdivided', 'parent land ' || u(196) || ' is inactive',
+  $$SELECT t_parcel(u(197), u(196), '9-A')$$);
+SELECT t_ok('B1: a portfolio is deactivated',
+  $$INSERT INTO portfolios (id, name) VALUES (u(14), 'Dormant Portfolio')$$,
+  $$UPDATE portfolios SET is_active = false WHERE id = u(14)$$);
+SELECT t_err('B1: an inactive portfolio cannot take new members', 'portfolio ' || u(14) || ' is inactive',
+  $$INSERT INTO funding_accounts (portfolio_id, investor_id) VALUES (u(14), u(1))$$);
+SELECT t_err('B1: drafts can still be deleted (only finished records are permanent)', 'T_DELETED_DRAFT',
+  $$INSERT INTO journal_entries (id, occurred_on, description) VALUES (u(1451), current_date, 'draft to delete')$$,
+  $$DELETE FROM journal_entries WHERE id = u(1451)$$,
+  $$DO $x$ BEGIN IF NOT EXISTS (SELECT 1 FROM journal_entries WHERE id = u(1451)) THEN RAISE EXCEPTION 'T_DELETED_DRAFT'; END IF; END $x$ $$);
+
+-- ---------------------------------------------------------------------------
+-- B2: every table is protected, including tables added in the future
+-- ---------------------------------------------------------------------------
+SELECT t_true('B2: every table has the permission, stamp and audit triggers',
+  $$NOT EXISTS (SELECT 1 FROM erp_unprotected_tables())$$);
+SELECT t_err('B2: a table created later is protected automatically (columns and triggers added)', 'T_NEW_TABLE_PROTECTED',
+  $$SET LOCAL ROLE postgres$$,
+  $$CREATE TABLE future_widgets (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text)$$,
+  $$DO $x$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM erp_unprotected_tables())
+         AND (SELECT count(*) FROM information_schema.columns WHERE table_name = 'future_widgets'
+               AND column_name IN ('created_by','created_at','updated_by','updated_at')) = 4 THEN
+        RAISE EXCEPTION 'T_NEW_TABLE_PROTECTED';
+      END IF;
+    END $x$ $$);
+SELECT t_err('B2: a table created later is closed to the application by default', 'permission denied for table future_widgets',
+  $$SET LOCAL ROLE postgres$$,
+  $$CREATE TABLE future_widgets (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text)$$,
+  $$SET LOCAL ROLE erp_app$$,
+  $$SELECT count(*) FROM future_widgets$$);
+SELECT t_err('B2: even once granted, a new table is unwritable until it has a permission rule', 'no permission rule defined for table future_widgets',
+  $$SET LOCAL ROLE postgres$$,
+  $$CREATE TABLE future_widgets (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text)$$,
+  $$GRANT SELECT, INSERT ON future_widgets TO erp_app$$,
+  $$SET LOCAL ROLE erp_app$$,
+  $$INSERT INTO future_widgets (name) VALUES ('w')$$);
+SELECT t_err('B2: a function created later is not executable by the application by default', 'permission denied for function future_fn',
+  $$SET LOCAL ROLE postgres$$,
+  $$CREATE FUNCTION public.future_fn() RETURNS int LANGUAGE sql AS 'SELECT 1'$$,
+  $$SET LOCAL ROLE erp_app$$,
+  $$SELECT future_fn()$$);
+
+-- ---------------------------------------------------------------------------
+-- Who / when stamps
+-- ---------------------------------------------------------------------------
+SELECT t_ok('stamps: forged creator, time and approver values are ignored',
+  $$INSERT INTO investors (id, full_name, created_by, created_at) VALUES (u(21), 'Investor TwentyOne', u(9999), '2000-01-01')$$,
+  $$INSERT INTO journal_entries (id, occurred_on, description, approved_by, posted_at) VALUES (u(1430), current_date, 'forged', u(9004), now())$$);
+SELECT t_true('stamps: the real creator and time were recorded; the draft has no approver',
+  $$(SELECT created_by = u(9001) AND created_at > '2020-01-01' FROM investors WHERE id = u(21))
+    AND (SELECT approved_by IS NULL AND posted_at IS NULL AND created_by = u(9001) FROM journal_entries WHERE id = u(1430))$$);
+SELECT t_ok_as(u(9002), 'stamps: Data Entry One updates the investor',
+  $$UPDATE investors SET contact_phone = '0500000000' WHERE id = u(21)$$);
+SELECT t_true('stamps: update recorded by Data Entry One, creator unchanged',
+  $$(SELECT updated_by = u(9002) AND updated_at IS NOT NULL AND created_by = u(9001) FROM investors WHERE id = u(21))$$);
+SELECT t_true('stamps: journal entry records preparer, poster and reverser',
+  $$(SELECT created_by = u(9005) AND approved_by = u(9001) AND reversed_by = u(9001) AND reversed_at IS NOT NULL
+       FROM journal_entries WHERE id = u(1201))$$);
+SELECT t_true('stamps: profit realization records preparer and approving admin',
+  $$(SELECT created_by = u(9001) AND approved_by = u(9999) AND approved_at IS NOT NULL FROM profit_realizations WHERE id = u(701))$$);
+SELECT t_true('stamps: distribution records preparer, approving admin and paying admin',
+  $$(SELECT created_by = u(9001) AND approved_by = u(9999) AND paid_by = u(9999) AND paid_at IS NOT NULL
+       FROM distribution_batches WHERE id = u(501))$$);
+SELECT t_true('stamps: voided sale records who voided it',
+  $$(SELECT voided_by = u(9001) AND voided_at IS NOT NULL FROM deal_sales WHERE id = u(404))$$);
+SELECT t_true('stamps: closed portfolio records the closing admin',
+  $$(SELECT closed_by = u(9999) AND closed_at IS NOT NULL FROM portfolios WHERE id = u(12))$$);
+
+-- ---------------------------------------------------------------------------
+-- Audit trail
+-- ---------------------------------------------------------------------------
+SELECT t_true('audit: journal entry history = create (preparer), post (poster), reverse (reverser)',
+  $$(SELECT array_agg(action || ':' || actor_id ORDER BY occurred_at) FROM audit_events
+      WHERE entity_type = 'journal_entries' AND entity_id = u(1201)::text)
+    = ARRAY['create:' || u(9005), 'post:' || u(9001), 'reverse:' || u(9001)]$$);
+SELECT t_true('audit: profit approval recorded with the approving admin',
+  $$EXISTS (SELECT 1 FROM audit_events WHERE entity_type = 'profit_realizations' AND entity_id = u(701)::text
+              AND action = 'approve' AND actor_id = u(9999))$$);
+SELECT t_true('audit: distribution approval and payment recorded',
+  $$(SELECT array_agg(action ORDER BY occurred_at) FROM audit_events
+      WHERE entity_type = 'distribution_batches' AND entity_id = u(501)::text AND action IN ('approve','pay'))
+    = ARRAY['approve', 'pay']$$);
+SELECT t_true('audit: voided sale recorded', $$EXISTS (SELECT 1 FROM audit_events WHERE entity_type = 'deal_sales'
+  AND entity_id = u(404)::text AND action = 'void' AND actor_id = u(9001))$$);
+SELECT t_true('audit: portfolio closure recorded', $$EXISTS (SELECT 1 FROM audit_events WHERE entity_type = 'portfolios'
+  AND entity_id = u(12)::text AND action = 'close' AND actor_id = u(9999))$$);
+SELECT t_true('audit: updates keep the values before and after',
+  $$EXISTS (SELECT 1 FROM audit_events WHERE entity_type = 'investors' AND entity_id = u(21)::text AND action = 'update'
+              AND old_values->>'contact_phone' IS NULL AND new_values->>'contact_phone' = '0500000000' AND actor_id = u(9002))$$);
+SELECT t_true('audit: rejected attempts leave no audit record (four-eyes failures rolled back)',
+  $$NOT EXISTS (SELECT 1 FROM audit_events WHERE entity_type = 'journal_entries' AND entity_id = u(1421)::text)$$);
+SELECT t_true('audit: every audit record names its employee',
+  $$NOT EXISTS (SELECT 1 FROM audit_events WHERE actor_id IS NULL)$$);
+
+-- ---------------------------------------------------------------------------
 -- Settling
 -- ---------------------------------------------------------------------------
-SELECT t_ok('settle: D1 settles once every sale and expense is in an approved realization',
+SELECT t_ok_as(u(9999), 'settle: D1 settles once every sale and expense is in an approved realization',
   $$UPDATE deals SET status = 'settled' WHERE id = u(201)$$);
+SELECT t_true('settle: settlement recorded with the settling admin, and audited',
+  $$(SELECT settled_by = u(9999) AND settled_at IS NOT NULL FROM deals WHERE id = u(201))
+    AND EXISTS (SELECT 1 FROM audit_events WHERE entity_type = 'deals' AND entity_id = u(201)::text
+                  AND action = 'settle' AND actor_id = u(9999))$$);
 
 -- ---------------------------------------------------------------------------
 -- Report
