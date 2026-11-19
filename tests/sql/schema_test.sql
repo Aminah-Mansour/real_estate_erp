@@ -279,10 +279,20 @@ SELECT t_err('office fee: cannot be recorded as a deal expense', 'deal_costs_not
   $$SELECT t_cost(NULL, u(201), 1000, u(26), 'office_fee')$$);
 SELECT t_err('tax: VAT cannot be recorded on anything (purchase tax is the only tax)', 'deal_costs_not_computed_charge',
   $$SELECT t_cost(NULL, u(201), 15000, u(26), 'VAT')$$);
-SELECT t_true('tax: purchase tax is the only tax column; Dalalah is a separate commission; no VAT column exists',
-  $$(SELECT array_agg(table_name || '.' || column_name ORDER BY table_name, column_name) FROM information_schema.columns
-      WHERE table_schema = 'public' AND (column_name LIKE '%tax%' OR column_name LIKE '%vat%' OR column_name LIKE '%dalalah%'))
+SELECT t_true('tax: purchase tax is the only stored tax column; Dalalah is a separate commission; no VAT column exists',
+  $$(SELECT array_agg(c.table_name || '.' || c.column_name ORDER BY c.table_name, c.column_name)
+       FROM information_schema.columns c
+       JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+      WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE'
+        AND (c.column_name LIKE '%tax%' OR c.column_name LIKE '%vat%' OR c.column_name LIKE '%dalalah%'))
     = ARRAY['land_purchases.dalalah', 'land_purchases.purchase_tax']$$);
+SELECT t_true('tax: the only view showing charges is the acquisition preview, with the same two charges and no VAT',
+  $$(SELECT array_agg(c.table_name || '.' || c.column_name ORDER BY c.table_name, c.column_name)
+       FROM information_schema.columns c
+       JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+      WHERE c.table_schema = 'public' AND t.table_type = 'VIEW'
+        AND (c.column_name LIKE '%tax%' OR c.column_name LIKE '%vat%' OR c.column_name LIKE '%dalalah%'))
+    = ARRAY['land_acquisition_preview.dalalah', 'land_acquisition_preview.purchase_tax']$$);
 
 -- ---------------------------------------------------------------------------
 -- Lands
@@ -320,6 +330,38 @@ SELECT t_err('land: parcel must be in the same city as its parent', 'lands_paren
 SELECT t_err('land: parcel cannot be prospective', 'lands_parcel_status',
   $$INSERT INTO lands (parent_land_id, city, plan_number, land_number, status)
     VALUES (u(101), 'Riyadh', '1234', '10-X', 'prospective')$$);
+SELECT t_ok('land: street width recorded in metres', $$UPDATE lands SET street_width_m = 16 WHERE id = u(103)$$);
+SELECT t_err('land: street width must be positive', 'lands_street_width_m_check',
+  $$UPDATE lands SET street_width_m = 0 WHERE id = u(103)$$);
+SELECT t_true('preview: land not yet bought shows 5% tax, 2.5% Dalalah and acquisition cost without recording a purchase',
+  $$(SELECT (purchase_price, purchase_tax, dalalah, total_acquisition_cost, purchase_recorded)
+       = (500000.00, 25000.00, 12500.00, 537500.00, false) FROM land_acquisition_preview WHERE land_id = u(103))
+    AND NOT EXISTS (SELECT 1 FROM land_purchases WHERE land_id = u(103))$$);
+SELECT t_true('preview: a bought land shows its recorded purchase figures',
+  $$(SELECT (purchase_tax, dalalah, total_acquisition_cost, purchase_recorded) = (50000.00, 25000.00, 1075000.00, true)
+       FROM land_acquisition_preview WHERE land_id = u(102))$$);
+SELECT t_true('preview: recorded purchases and the preview use the same rule functions',
+  $$NOT EXISTS (SELECT 1 FROM land_purchases
+                 WHERE (purchase_tax, dalalah, total_cost)
+                       IS DISTINCT FROM (purchase_tax_amount(amount), dalalah_amount(amount), acquisition_cost_amount(amount)))$$);
+SELECT t_true('city: land entered as "Jeddah" is stored as جدة with city code jeddah',
+  $$(SELECT (city, city_code) = (U&'\062C\062F\0629', 'jeddah') FROM lands WHERE id = u(102))$$);
+SELECT t_err('city: "جدة" and "Jeddah" are the same city (duplicate land rejected)', 'lands_identity_uq',
+  $$INSERT INTO lands (city, plan_number, land_number) VALUES ('جدة', '555', '7')$$);
+SELECT t_err('city: spelling variants match regardless of case and spaces ("  JEDDAH ")', 'lands_identity_uq',
+  $$INSERT INTO lands (city, plan_number, land_number) VALUES ('  JEDDAH ', '555', '7')$$);
+SELECT t_err('city: Arabic variant spelling "جده" also resolves to Jeddah', 'lands_identity_uq',
+  $$INSERT INTO lands (city, plan_number, land_number) VALUES ('جده', '555', '7')$$);
+SELECT t_err('city: unknown city names are rejected', 'unknown city "Atlantis"',
+  $$INSERT INTO lands (city, plan_number, land_number) VALUES ('Atlantis', '1', '1')$$);
+SELECT t_ok('city: a parcel may be entered with its parent''s city in English (parent stored in Arabic)',
+  $$INSERT INTO lands (parent_land_id, city, plan_number, land_number, status) VALUES (u(103), 'Dammam', '900', '1-A', 'available')$$);
+SELECT t_true('city: every city has an Arabic UI name and an English name',
+  $$NOT EXISTS (SELECT 1 FROM cities WHERE name_ar !~ '[؀-ۿ]' OR name_en !~ '^[A-Za-z ]+$')$$);
+SELECT t_true('city: preview shows the Arabic city name for the UI plus the English name',
+  $$(SELECT (city, city_code, city_name_en) = ('جدة', 'jeddah', 'Jeddah') FROM land_acquisition_preview WHERE land_id = u(102))$$);
+SELECT t_true('preview: parcels are not listed (they share their land''s acquisition cost)',
+  $$NOT EXISTS (SELECT 1 FROM land_acquisition_preview p JOIN lands l ON l.id = p.land_id WHERE l.parent_land_id IS NOT NULL)$$);
 
 -- ---------------------------------------------------------------------------
 -- Deals

@@ -60,9 +60,49 @@ CREATE TABLE portfolios (
 );
 
 -- ---------------------------------------------------------------------------
+-- Cities (reference data). One row per city: a stable code, the Arabic name shown in the UI and the
+-- English name. city_aliases lists every accepted spelling (matched ignoring case and surrounding spaces),
+-- so 'جدة' and 'Jeddah' are the same city. Add a city by inserting it here with its aliases.
+-- ---------------------------------------------------------------------------
+CREATE TABLE cities (
+  code text PRIMARY KEY CHECK (code ~ '^[a-z_]+$'),
+  name_ar text NOT NULL UNIQUE CHECK (name_ar = btrim(name_ar) AND name_ar <> ''),
+  name_en text NOT NULL UNIQUE CHECK (name_en = btrim(name_en) AND name_en <> '')
+);
+COMMENT ON TABLE cities IS 'Reference list of cities. name_ar is the name shown in the Arabic UI; name_en in the English UI.';
+
+CREATE TABLE city_aliases (
+  alias text PRIMARY KEY CHECK (alias = lower(btrim(alias)) AND alias <> ''),
+  city_code text NOT NULL REFERENCES cities(code)
+);
+COMMENT ON TABLE city_aliases IS 'Accepted spellings of each city, stored lower-case and trimmed.';
+
+INSERT INTO cities (code, name_ar, name_en) VALUES
+  ('riyadh',  'الرياض',          'Riyadh'),
+  ('jeddah',  'جدة',             'Jeddah'),
+  ('makkah',  'مكة المكرمة',     'Makkah'),
+  ('madinah', 'المدينة المنورة', 'Madinah'),
+  ('dammam',  'الدمام',          'Dammam'),
+  ('khobar',  'الخبر',           'Khobar'),
+  ('taif',    'الطائف',          'Taif'),
+  ('abha',    'أبها',            'Abha');
+
+INSERT INTO city_aliases (alias, city_code)
+SELECT lower(name_ar), code FROM cities
+UNION SELECT lower(name_en), code FROM cities
+UNION SELECT lower(code), code FROM cities
+UNION SELECT a, c FROM (VALUES
+  ('جده', 'jeddah'), ('jiddah', 'jeddah'), ('jedda', 'jeddah'),
+  ('مكة', 'makkah'), ('mecca', 'makkah'), ('makkah al mukarramah', 'makkah'),
+  ('المدينة', 'madinah'), ('medina', 'madinah'), ('al madinah', 'madinah'),
+  ('al khobar', 'khobar')) AS extra (a, c);
+
+-- ---------------------------------------------------------------------------
 -- Lands and parcels
 -- ---------------------------------------------------------------------------
--- A land is identified by city + plan number (رقم المخطط) + land number (رقم القطعة).
+-- A land is identified by city + plan number (رقم المخطط) + land number (رقم القطعة). The city may be
+-- entered in any accepted spelling; the database resolves it to city_code (used for identity) and stores
+-- the city's Arabic name in lands.city.
 -- An original land has parent_land_id NULL; subdividing it creates child parcels (which may be
 -- subdivided again). Statuses 'sold' and 'partially_sold' are maintained automatically from deal_sales.
 CREATE TABLE lands (
@@ -75,14 +115,16 @@ CREATE TABLE lands (
   purchase_price numeric(18,2) CHECK (purchase_price > 0),
   sale_price numeric(18,2) CHECK (sale_price > 0),
   area_sqm numeric(14,2) CHECK (area_sqm > 0),
+  street_width_m numeric(6,2) CHECK (street_width_m > 0),
   title text,
   status text NOT NULL DEFAULT 'prospective' CHECK (status IN
     ('prospective','available','listed','under_contract','partially_sold','sold','cancelled')),
   acquired_on date,
   created_at timestamptz NOT NULL DEFAULT now(),
-  CONSTRAINT lands_identity_uq UNIQUE (city, plan_number, land_number),
-  CONSTRAINT lands_id_city_uq UNIQUE (id, city),
-  CONSTRAINT lands_parent_fk FOREIGN KEY (parent_land_id, city) REFERENCES lands (id, city),
+  city_code text NOT NULL REFERENCES cities(code),
+  CONSTRAINT lands_identity_uq UNIQUE (city_code, plan_number, land_number),
+  CONSTRAINT lands_id_city_uq UNIQUE (id, city_code),
+  CONSTRAINT lands_parent_fk FOREIGN KEY (parent_land_id, city_code) REFERENCES lands (id, city_code),
   CONSTRAINT lands_not_own_parent CHECK (parent_land_id <> id),
   CONSTRAINT lands_purchase_recorded CHECK (parent_land_id IS NOT NULL OR status IN ('prospective','cancelled')
                                             OR (purchase_price IS NOT NULL AND acquired_on IS NOT NULL)),
@@ -92,7 +134,10 @@ COMMENT ON COLUMN lands.purchase_price IS
   'Purchase price excluding purchase tax and Dalalah. Original land: price paid. Parcel: its allocated share of the parent''s purchase price, which also allocates the purchase tax and Dalalah (required before profit on its sale can be approved; parcels of one land never total more than the land).';
 COMMENT ON COLUMN lands.sale_price IS 'Optional asking price. The actual sale amount is deal_sales.sale_amount.';
 COMMENT ON COLUMN lands.area_sqm IS 'Optional area in square metres; parcels of one land never total more than the land.';
+COMMENT ON COLUMN lands.street_width_m IS 'Optional width in metres of the street the land faces.';
 COMMENT ON COLUMN lands.parent_land_id IS 'Set on parcels created by subdividing a land; never changes after creation.';
+COMMENT ON COLUMN lands.city IS 'Arabic city name for the UI (cities.name_ar). Any accepted spelling may be entered; it is normalized on save.';
+COMMENT ON COLUMN lands.city_code IS 'Resolved city (cities.code); part of the land''s identity, so all spellings of a city match.';
 
 -- ---------------------------------------------------------------------------
 -- Deals (one investment per original land)
@@ -203,6 +248,18 @@ COMMENT ON COLUMN capital_movements.transfer_group_id IS 'Pairs exactly one tran
 -- ---------------------------------------------------------------------------
 -- Land purchase, expenses and sales
 -- ---------------------------------------------------------------------------
+-- The purchase charge rules, defined once and used both by land_purchases and by the preview of lands
+-- not yet bought: purchase tax 5% (the only tax), Dalalah 2.5% (a commission), rounded to the halala.
+CREATE FUNCTION purchase_tax_amount(p_price numeric) RETURNS numeric LANGUAGE sql IMMUTABLE STRICT AS
+$$ SELECT round(p_price * 0.05, 2) $$;
+CREATE FUNCTION dalalah_amount(p_price numeric) RETURNS numeric LANGUAGE sql IMMUTABLE STRICT AS
+$$ SELECT round(p_price * 0.025, 2) $$;
+CREATE FUNCTION acquisition_cost_amount(p_price numeric) RETURNS numeric LANGUAGE sql IMMUTABLE STRICT AS
+$$ SELECT p_price + purchase_tax_amount(p_price) + dalalah_amount(p_price) $$;
+COMMENT ON FUNCTION purchase_tax_amount(numeric) IS 'Purchase tax: 5% of the land purchase price, rounded to the halala.';
+COMMENT ON FUNCTION dalalah_amount(numeric) IS 'Land Purchase Brokerage Commission (Dalalah) / دلالة شراء الأرض: 2.5% of the purchase price, rounded to the halala.';
+COMMENT ON FUNCTION acquisition_cost_amount(numeric) IS 'Total acquisition cost: purchase price + purchase tax + Dalalah.';
+
 -- Purchase of a deal's land, paid from the deal's cash: once per deal. amount equals lands.purchase_price;
 -- purchase tax (5%) and Dalalah (2.5%) are computed here and are the only purchase charges. Its posted
 -- journal entry must pay out (credit cash accounts by) exactly total_cost.
@@ -211,9 +268,9 @@ CREATE TABLE land_purchases (
   deal_id uuid NOT NULL UNIQUE REFERENCES deals(id),
   land_id uuid NOT NULL UNIQUE REFERENCES lands(id),
   amount numeric(18,2) NOT NULL CHECK (amount > 0),
-  purchase_tax numeric(18,2) GENERATED ALWAYS AS (round(amount * 0.05, 2)) STORED,
-  dalalah numeric(18,2) GENERATED ALWAYS AS (round(amount * 0.025, 2)) STORED,
-  total_cost numeric(18,2) GENERATED ALWAYS AS (amount + round(amount * 0.05, 2) + round(amount * 0.025, 2)) STORED,
+  purchase_tax numeric(18,2) GENERATED ALWAYS AS (purchase_tax_amount(amount)) STORED,
+  dalalah numeric(18,2) GENERATED ALWAYS AS (dalalah_amount(amount)) STORED,
+  total_cost numeric(18,2) GENERATED ALWAYS AS (acquisition_cost_amount(amount)) STORED,
   paid_on date NOT NULL,
   journal_entry_id uuid NOT NULL UNIQUE REFERENCES journal_entries(id)
 );
@@ -425,6 +482,8 @@ CREATE TABLE audit_events (
 -- Indexes on foreign-key columns (PostgreSQL does not create these automatically)
 -- ---------------------------------------------------------------------------
 CREATE INDEX lands_parent_idx ON lands (parent_land_id);
+CREATE INDEX lands_city_idx ON lands (city_code);
+CREATE INDEX city_aliases_city_idx ON city_aliases (city_code);
 CREATE INDEX deals_land_idx ON deals (land_id);
 CREATE INDEX funding_accounts_deal_idx ON funding_accounts (deal_id);
 CREATE INDEX funding_accounts_investor_idx ON funding_accounts (investor_id);
@@ -452,6 +511,32 @@ CREATE INDEX distribution_lines_batch_idx ON distribution_lines (batch_id);
 CREATE INDEX distribution_lines_investor_idx ON distribution_lines (investor_id);
 CREATE INDEX distribution_lines_account_idx ON distribution_lines (funding_account_id);
 CREATE INDEX payouts_line_idx ON payouts (distribution_line_id);
+
+-- ---------------------------------------------------------------------------
+-- Read-only views
+-- ---------------------------------------------------------------------------
+-- Purchase charges for every original land with a purchase price. For a land already bought, the figures
+-- come from its recorded purchase; for a land not yet bought they are a preview computed by the same
+-- rule functions. A preview creates no purchase, payment or accounting record.
+CREATE VIEW land_acquisition_preview AS
+SELECT l.id AS land_id,
+       l.city,
+       l.city_code,
+       c.name_en AS city_name_en,
+       l.plan_number,
+       l.land_number,
+       l.status,
+       l.purchase_price,
+       coalesce(lp.purchase_tax, purchase_tax_amount(l.purchase_price)) AS purchase_tax,
+       coalesce(lp.dalalah, dalalah_amount(l.purchase_price)) AS dalalah,
+       coalesce(lp.total_cost, acquisition_cost_amount(l.purchase_price)) AS total_acquisition_cost,
+       lp.id IS NOT NULL AS purchase_recorded
+  FROM lands l
+  JOIN cities c ON c.code = l.city_code
+  LEFT JOIN land_purchases lp ON lp.land_id = l.id
+ WHERE l.parent_land_id IS NULL AND l.purchase_price IS NOT NULL;
+COMMENT ON VIEW land_acquisition_preview IS
+  'Purchase tax, Dalalah and total acquisition cost per original land: recorded figures once purchased, otherwise a preview.';
 
 -- ===========================================================================
 -- Balances
@@ -631,7 +716,23 @@ END $$;
 CREATE FUNCTION lands_before_write() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
   parent lands%ROWTYPE;
+  resolved cities%ROWTYPE;
 BEGIN
+  -- Resolve the city from any accepted spelling (or from city_code alone); store its Arabic name.
+  IF NEW.city IS NOT NULL THEN
+    SELECT c.* INTO resolved FROM city_aliases a JOIN cities c ON c.code = a.city_code
+     WHERE a.alias = lower(btrim(NEW.city));
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'unknown city "%": add it to cities and city_aliases', NEW.city;
+    END IF;
+  ELSIF NEW.city_code IS NOT NULL THEN
+    SELECT * INTO resolved FROM cities WHERE code = NEW.city_code;
+  END IF;
+  IF resolved.code IS NOT NULL THEN
+    NEW.city_code := resolved.code;
+    NEW.city := resolved.name_ar;
+  END IF;
+
   IF TG_OP = 'UPDATE' AND NEW.parent_land_id IS DISTINCT FROM OLD.parent_land_id THEN
     RAISE EXCEPTION 'land %: parent_land_id cannot be changed after creation', OLD.id;
   END IF;

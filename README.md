@@ -23,6 +23,16 @@ enforced by the database itself (constraints and triggers), not only by applicat
   as deal expenses (nor can office fees).
 - Each deal buys one original land, once.
 
+### Cities
+- Cities are reference data (`cities`): a stable code, the **Arabic name shown in the UI** (`name_ar`)
+  and the English name (`name_en`). `city_aliases` lists every accepted spelling: "جدة", "جده", "Jeddah",
+  "Jiddah" and "  JEDDAH " are all the same city.
+- A land's city can be entered in any accepted spelling. The database resolves it to `lands.city_code`
+  (used to identify the land) and stores the Arabic name in `lands.city`, so the same land can't be
+  entered twice under different spellings. Unknown city names are rejected; add new cities to `cities`
+  and `city_aliases`.
+- Included: Riyadh, Jeddah, Makkah, Madinah, Dammam, Khobar, Taif, Abha.
+
 ### Selling land
 - A land is sold whole, or subdivided into parcels (which can be subdivided again) that are sold separately.
   A subdivided land cannot also be sold whole, and no land or parcel can be sold twice.
@@ -95,6 +105,29 @@ Keep the internal name `dalalah` in the database and code; use the labels above 
   entry and voiding the record.
 - Posted journal entries balance and can only be corrected by an exact reversal.
 
+## Development seed data
+
+`db/seeds/` holds sample data for **local development only**. It is never loaded by the schema or by
+production; each seed refuses to run unless explicitly flagged as development:
+
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v seed_env=development -f db/seeds/dev_jeddah_lands.sql
+```
+
+`dev_jeddah_lands.sql` adds three Jeddah (جدة) lands as **prospective** (not yet bought), with only the
+facts provided: plan number, plot number, area, street width and purchase price. It creates no investors,
+deals, purchase dates, bank transactions or accounting entries. It is idempotent: re-running it never
+duplicates a land and never alters a land that has moved past prospective.
+
+Their 5% purchase tax and 2.5% Dalalah are shown by the `land_acquisition_preview` view, which uses the same
+rule functions (`purchase_tax_amount`, `dalalah_amount`, `acquisition_cost_amount`) as recorded purchases:
+
+| Plan | Plot | Area | Street | Purchase price | Purchase tax (5%) | Dalalah (2.5%) | Total acquisition cost |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 99/أ | 1200 | 900 m² | 16 m | 1,500,000 | 75,000 | 37,500 | 1,612,500 |
+| 29/ب | 400 | 900 m² | 16 m | 1,200,000 | 60,000 | 30,000 | 1,290,000 |
+| 87 | 560 | 880 m² | 16 m | 1,700,000 | 85,000 | 42,500 | 1,827,500 |
+
 ## Running the schema tests
 
 Requires Docker.
@@ -103,6 +136,8 @@ Requires Docker.
 ./scripts/test_schema.sh
 ```
 
-This loads the schema into a throwaway PostgreSQL 16 container, runs `tests/sql/schema_test.sql`, prints
-a PASS/FAIL line per test (rejections show the database's error message), and exits non-zero on any failure.
+This loads the schema into a throwaway PostgreSQL 16 container, runs `tests/sql/schema_test.sql`, then
+tests the development seed in a separate empty database (`tests/sql/seed_test.sql`: refused without the
+flag, run twice with it). It prints a PASS/FAIL line per test (rejections show the database's error
+message) and exits non-zero on any failure.
 Use `POSTGRES_IMAGE` to test against another PostgreSQL version (15+).
