@@ -10,7 +10,9 @@ import sys
 
 import psycopg
 
-from .security import MIN_PASSWORD_LENGTH, hash_password
+from . import password_policy
+from .password_policy import MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH
+from .security import hash_password
 
 ADMIN_DISPLAY_NAME = "Admin"
 
@@ -21,8 +23,7 @@ def create_admin(owner_database_url: str, email: str, password: str) -> str:
     Runs as the database owner: erp_bootstrap_admin only works while no admin exists. The password is
     never stored or logged; only its hash reaches the database.
     """
-    if len(password) < MIN_PASSWORD_LENGTH:
-        raise ValueError(f"The password must be at least {MIN_PASSWORD_LENGTH} characters.")
+    password_policy.check(password, email)          # raises PasswordRejected (a ValueError) with the reasons
     password_hash = hash_password(password)
     with psycopg.connect(owner_database_url) as conn:
         # Two transactions: one employee per transaction (the system user creates the admin, then the
@@ -44,7 +45,10 @@ def _create_admin_command(args) -> int:
         print("ERP_OWNER_DATABASE_URL is not set (see .env).", file=sys.stderr)
         return 2
     print(f"Creating the administrator account '{ADMIN_DISPLAY_NAME}' <{args.email}>.")
-    password = getpass.getpass(f"Choose a password (at least {MIN_PASSWORD_LENGTH} characters): ")
+    print(f"Password policy: {MIN_PASSWORD_LENGTH}-{MAX_PASSWORD_LENGTH} characters; spaces, Arabic and any symbols "
+          "are allowed. Long passphrases are best. Common or breached passwords, simple sequences and "
+          "passwords based on CAPNOVA or your email are rejected.")
+    password = getpass.getpass("Choose a password: ")
     if password != getpass.getpass("Repeat the password: "):
         print("The passwords do not match.", file=sys.stderr)
         return 1
