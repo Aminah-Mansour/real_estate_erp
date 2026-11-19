@@ -27,7 +27,15 @@ def test_login_page_is_arabic_and_right_to_left_by_default(client):
     page = client.get("/login")
     assert page.status_code == 200
     assert '<html lang="ar" dir="rtl">' in page.text
-    assert "تسجيل الدخول" in page.text and "نظام إدارة العقارات" in page.text
+    assert "تسجيل الدخول" in page.text and "كابنوفا" in page.text
+    assert "منصة إدارة المحافظ الاستثمارية العقارية" in page.text
+    assert 'src="/static/img/capnova-logo.png"' in page.text
+
+
+@pytest.mark.parametrize("name", ["capnova-logo.png", "capnova-logo-light.png", "capnova-mark.png"])
+def test_capnova_logo_is_served(client, name):
+    response = client.get(f"/static/img/{name}")
+    assert response.status_code == 200 and response.headers["content-type"] == "image/png"
 
 
 @pytest.mark.parametrize("path", PAGES)
@@ -100,7 +108,8 @@ def test_dashboard_summary_cards(admin):
     page = admin.get("/")
     assert page.status_code == 200
     html = page.text
-    assert "مرحبًا، Admin" in html
+    assert "مرحبًا بك في كابنوفا" in html and "<strong>Admin</strong>" in html
+    assert 'src="/static/img/capnova-logo-light.png"' in html
     for amount in ["4,400,000.00", "220,000.00", "110,000.00", "4,730,000.00"]:
         assert amount in html, amount
     assert "ر.س" in html

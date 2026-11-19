@@ -183,7 +183,7 @@ def dashboard(request: Request):
         return {
             "totals": queries.land_totals(conn),
             "lands": queries.lands(conn),
-            "statuses": queries.land_status_counts(conn),
+            "counts": queries.module_counts(conn),
             "activity": queries.recent_activity(conn),
         }
     return _page(request, "dashboard.html", "dashboard", load)
