@@ -1825,6 +1825,52 @@ CREATE FUNCTION erp_act_as_system() RETURNS void LANGUAGE sql SECURITY DEFINER S
      SET xact_id = EXCLUDED.xact_id, user_id = EXCLUDED.user_id, session_id = NULL, set_at = clock_timestamp()
 $$;
 
+-- Internal: names p_user as acting for this transaction without a session, for the two credential
+-- functions below only (they act as the employee whose own credentials change, so the normal permission,
+-- stamp and audit rules apply). Not callable by the application or the login service directly.
+CREATE FUNCTION erp_act_as_internal(p_user uuid) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+  PERFORM erp_assert_no_switch(p_user);
+  INSERT INTO acting_context (backend_pid, xact_id, user_id, session_id)
+  VALUES (pg_backend_pid(), txid_current(), p_user, NULL)
+  ON CONFLICT (backend_pid) DO UPDATE
+     SET xact_id = EXCLUDED.xact_id, user_id = EXCLUDED.user_id, session_id = NULL, set_at = clock_timestamp();
+END $$;
+
+-- Setup / password reset (database owner only): stores an employee's Argon2id password hash, which the
+-- application computes; plain passwords never reach the database. Clears any lockout.
+CREATE FUNCTION erp_set_password(p_user uuid, p_hash text) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM app_users WHERE id = p_user AND NOT is_system AND status = 'active') THEN
+    RAISE EXCEPTION 'passwords can only be set for active employees (never the system user)';
+  END IF;
+  PERFORM erp_act_as_internal(p_user);
+  INSERT INTO user_credentials (user_id, password_hash) VALUES (p_user, p_hash)
+  ON CONFLICT (user_id) DO UPDATE
+     SET password_hash = EXCLUDED.password_hash, password_changed_at = now(),
+         failed_login_count = 0, locked_until = NULL;
+END $$;
+
+-- Login bookkeeping for the login service (erp_auth): a success resets the failure count and records the
+-- login time; 5 consecutive failures lock the account for 15 minutes. Disabled employees are ignored.
+CREATE FUNCTION erp_record_login_result(p_user uuid, p_success boolean) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM app_users WHERE id = p_user AND NOT is_system AND status = 'active')
+     OR NOT EXISTS (SELECT 1 FROM user_credentials WHERE user_id = p_user) THEN
+    RETURN;
+  END IF;
+  PERFORM erp_act_as_internal(p_user);
+  IF p_success THEN
+    UPDATE user_credentials SET failed_login_count = 0, locked_until = NULL, last_login_at = now()
+     WHERE user_id = p_user;
+  ELSE
+    UPDATE user_credentials
+       SET failed_login_count = failed_login_count + 1,
+           locked_until = CASE WHEN failed_login_count + 1 >= 5 THEN now() + interval '15 minutes' ELSE locked_until END
+     WHERE user_id = p_user;
+  END IF;
+END $$;
+
 -- The acting employee for this transaction, or NULL. Never reads anything the application can set.
 CREATE FUNCTION erp_acting_user_id() RETURNS uuid LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
   SELECT user_id FROM acting_context WHERE backend_pid = pg_backend_pid() AND xact_id = txid_current()
@@ -2320,6 +2366,10 @@ GRANT SELECT ON user_sessions TO erp_auth;
 REVOKE EXECUTE ON FUNCTION erp_bootstrap_admin(text, text, uuid) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION erp_act_as_system() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION erp_assert_no_switch(uuid) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION erp_act_as_internal(uuid) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION erp_set_password(uuid, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION erp_record_login_result(uuid, boolean) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION erp_record_login_result(uuid, boolean) TO erp_auth;
 REVOKE EXECUTE ON FUNCTION erp_protect_table(regclass) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION erp_open_session(uuid, text, interval) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION erp_revoke_session(uuid) FROM PUBLIC;

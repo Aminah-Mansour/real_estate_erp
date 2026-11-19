@@ -6,6 +6,34 @@ parcels, and distributes profit to investors directly or through shared portfoli
 The database schema is in `real_estate_erp_schema.sql` (PostgreSQL 15+). The business rules below are
 enforced by the database itself (constraints and triggers), not only by application code.
 
+## Running the web MVP (development data only)
+
+Requires Docker and [uv](https://docs.astral.sh/uv/).
+
+```sh
+./scripts/dev_setup.sh          # first time: database, schema, Jeddah seed, then choose the Admin password
+uv run real-estate-erp serve    # then open http://127.0.0.1:8000
+```
+
+`dev_setup.sh` creates `.env` with random development passwords (never committed), starts PostgreSQL 16 on
+`127.0.0.1:5433`, installs the schema with Alembic, creates the database logins, loads the Jeddah seed and
+creates the administrator **Admin** (`admin@office.local` by default); you choose the password at the
+prompt. It is never stored in code or in the database, only its Argon2id hash.
+
+The MVP is FastAPI + Jinja2, Arabic by default (right-to-left) with English, Western digits and SAR:
+
+- **Sign-in**: administrator only in this version. 5 failed attempts lock the account for 15 minutes.
+  The session cookie is `HttpOnly`, `Secure` and `SameSite=Strict`; forms carry CSRF tokens. Open the app at
+  `http://127.0.0.1:8000` (browsers accept secure cookies on localhost).
+- **Dashboard**: summary cards (lands, purchase price, 5% purchase tax, 2.5% Dalalah, total acquisition
+  cost), the lands, land status and recent activity from the audit trail.
+- **Lands**: the three Jeddah lands with tax, Dalalah and total acquisition cost, and a detail page per land.
+- **Investors, Portfolios, Accounting**: read-only overviews; future modules are listed in the navigation.
+- **Read-only by design**: every page runs in a database transaction that first verifies the session
+  (`erp_act_as`) and is then switched to `READ ONLY`. Sign-in and sign-out are the only writes.
+
+Run the web tests with `./scripts/test_app.sh` (throwaway database, random secrets).
+
 ## Business rules
 
 ### Tax

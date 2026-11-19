@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}{{ t('dashboard_title') }}{% endblock %}
+{% block heading %}{{ t('welcome') }}{{ '، ' if lang == 'ar' else ', ' }}{{ employee.full_name }}{% endblock %}
+{% block subheading %}<p class="topbar-sub">{{ t('dashboard_intro') }}</p>{% endblock %}
+{% block content %}
+
+<div class="notice">
+  {{ icon('info') }}<span>{{ t('preview_note') }}</span>
+</div>
+
+<section class="stats" aria-label="{{ t('dashboard_title') }}">
+  <article class="stat card">
+    <span class="icon-chip">{{ icon('lands') }}</span>
+    <p class="stat-label">{{ t('card_lands') }}</p>
+    <p class="stat-value">{{ count(totals.land_count) }}</p>
+    <p class="stat-foot">{{ t('card_total_area') }}: {{ qty(totals.area_sqm, 'sqm') }}</p>
+  </article>
+  <article class="stat card">
+    <span class="icon-chip">{{ icon('coins') }}</span>
+    <p class="stat-label">{{ t('card_purchase_price') }}</p>
+    <p class="stat-value">{{ money(totals.purchase_price) }}</p>
+  </article>
+  <article class="stat card">
+    <span class="icon-chip">{{ icon('receipt') }}</span>
+    <p class="stat-label">{{ t('card_purchase_tax') }}</p>
+    <p class="stat-value">{{ money(totals.purchase_tax) }}</p>
+  </article>
+  <article class="stat card">
+    <span class="icon-chip">{{ icon('handshake') }}</span>
+    <p class="stat-label">{{ t('card_dalalah') }}</p>
+    <p class="stat-value">{{ money(totals.dalalah) }}</p>
+  </article>
+  <article class="stat card stat-feature">
+    <span class="icon-chip icon-chip-copper">{{ icon('sigma') }}</span>
+    <p class="stat-label">{{ t('card_total_cost') }}</p>
+    <p class="stat-value">{{ money(totals.total_acquisition_cost) }}</p>
+  </article>
+</section>
+
+<div class="grid-2">
+  <section class="card panel">
+    <header class="panel-head">
+      <h2>{{ t('lands_overview') }}</h2>
+      <a class="link-arrow" href="/lands">{{ t('view_all') }}{{ icon('arrow', 'icon icon-sm flip-rtl') }}</a>
+    </header>
+    {% if lands %}
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>{{ t('land') }}</th>
+            <th class="num-col">{{ t('area') }}</th>
+            <th class="num-col">{{ t('purchase_price') }}</th>
+            <th class="num-col">{{ t('total_cost') }}</th>
+            <th>{{ t('status') }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for land in lands %}
+          <tr>
+            <td data-label="{{ t('land') }}">
+              <a class="land-ref" href="/lands/{{ land.land_id }}">
+                <strong>{{ t('plan_number') }} <bdi dir="{{ dir }}">{{ land.plan_number }}</bdi></strong>
+                <small>{{ t('land_number') }} <bdi dir="{{ dir }}">{{ land.land_number }}</bdi> · {{ land.city if lang == 'ar' else land.city_name_en }}</small>
+              </a>
+            </td>
+            <td class="num-col" data-label="{{ t('area') }}">{{ qty(land.area_sqm, 'sqm') }}</td>
+            <td class="num-col" data-label="{{ t('purchase_price') }}">{{ money(land.purchase_price) }}</td>
+            <td class="num-col strong" data-label="{{ t('total_cost') }}">{{ money(land.total_acquisition_cost) }}</td>
+            <td data-label="{{ t('status') }}"><span class="badge badge-{{ land.status }}">{{ t('status_' ~ land.status) }}</span></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="empty">{{ t('no_lands') }}</p>
+    {% endif %}
+  </section>
+
+  <div class="stack">
+    <section class="card panel">
+      <header class="panel-head"><h2>{{ t('status_breakdown') }}</h2></header>
+      <ul class="bars">
+        {% for row in statuses %}
+        <li>
+          <span class="bar-label">{{ t('status_' ~ row.status) }}</span>
+          <progress class="bar-track" value="{{ row.n }}" max="{{ totals.land_count or 1 }}">{{ row.n }}</progress>
+          <span class="bar-value">{{ count(row.n) }}</span>
+        </li>
+        {% else %}
+        <li class="empty">{{ t('no_lands') }}</li>
+        {% endfor %}
+      </ul>
+    </section>
+
+    <section class="card panel">
+      <header class="panel-head"><h2>{{ t('recent_activity') }}</h2></header>
+      <ul class="activity">
+        {% for item in activity %}
+        <li>
+          <span class="activity-icon">{{ icon('activity', 'icon icon-sm') }}</span>
+          <span class="activity-text">
+            <strong>{{ action_label(item.action) }}</strong> · {{ entity_label(item.entity_type) }}
+            <small>{{ item.actor or '—' }} · {{ ts(item.occurred_at) }}</small>
+          </span>
+        </li>
+        {% else %}
+        <li class="empty">{{ t('no_activity') }}</li>
+        {% endfor %}
+      </ul>
+    </section>
+  </div>
+</div>
+{% endblock %}

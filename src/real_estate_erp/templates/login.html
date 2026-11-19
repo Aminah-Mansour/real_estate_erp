@@ -1,0 +1,62 @@
+{% from "_icons.html" import icon, emblem %}
+<!doctype html>
+<html lang="{{ lang }}" dir="{{ dir }}">
+<head>
+  {% include "_head.html" %}
+  <title>{{ t('login_title') }} · {{ t('app_name') }}</title>
+</head>
+<body class="auth">
+<div class="auth-layout">
+  <section class="auth-hero" aria-hidden="true">
+    <div class="auth-hero-inner">
+      <div class="brand brand-lg">
+        {{ emblem() }}
+        <span class="brand-text"><strong>{{ t('app_name') }}</strong><small>{{ t('app_tagline') }}</small></span>
+      </div>
+      <h2>{{ t('login_hero_title') }}</h2>
+      <p>{{ t('login_hero_text') }}</p>
+      <ul class="hero-points">
+        <li>{{ icon('check') }}<span>{{ t('control_four_eyes') }}</span></li>
+        <li>{{ icon('check') }}<span>{{ t('control_audit') }}</span></li>
+        <li>{{ icon('check') }}<span>{{ t('control_tax') }}</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="auth-panel">
+    <div class="auth-top">
+      <span class="pill pill-dev"><span class="dot"></span>{{ t('dev_data') }}</span>
+      <a class="btn btn-ghost" href="/lang/{{ 'en' if lang == 'ar' else 'ar' }}?next=/login"
+         lang="{{ 'en' if lang == 'ar' else 'ar' }}">{{ icon('globe') }}<span>{{ t('switch_language') }}</span></a>
+    </div>
+
+    <div class="auth-card card">
+      <div class="auth-card-head">
+        <span class="icon-chip icon-chip-copper">{{ icon('lock') }}</span>
+        <div>
+          <h1>{{ t('login_title') }}</h1>
+          <p class="muted">{{ t('login_subtitle') }}</p>
+        </div>
+      </div>
+
+      {% if error %}<div class="alert alert-error" role="alert">{{ icon('info') }}<span>{{ t(error) }}</span></div>{% endif %}
+      {% if notice %}<div class="alert alert-info" role="status">{{ icon('info') }}<span>{{ t(notice) }}</span></div>{% endif %}
+
+      <form method="post" action="/login" class="form" autocomplete="on">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <label class="field">
+          <span>{{ t('email') }}</span>
+          <input type="email" name="email" value="{{ email }}" required autocomplete="username" dir="ltr" inputmode="email" autofocus>
+        </label>
+        <label class="field">
+          <span>{{ t('password') }}</span>
+          <input type="password" name="password" required autocomplete="current-password" dir="ltr">
+        </label>
+        <button type="submit" class="btn btn-copper btn-block">{{ t('sign_in') }}</button>
+      </form>
+      <p class="auth-note">{{ icon('lock', 'icon icon-sm') }}<span>{{ t('login_secure_note') }}</span></p>
+    </div>
+  </section>
+</div>
+</body>
+</html>

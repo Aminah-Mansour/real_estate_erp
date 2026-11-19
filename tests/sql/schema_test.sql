@@ -1290,6 +1290,44 @@ SELECT t_true('credentials: audited without the password hash',
   $$(SELECT count(*) = 2 AND bool_and(action = 'credential_create' AND NOT (new_values ? 'password_hash'))
        FROM audit_events WHERE entity_type = 'user_credentials')$$);
 
+-- Login bookkeeping and password setup
+SELECT t_err('login: the application cannot set passwords', 'permission denied for function erp_set_password',
+  $$SELECT erp_set_password(u(9002), '$argon2id$v=19$m=65536,t=3,p=4$eA$eA')$$);
+SELECT t_err('login: the login service cannot set passwords either (setup is owner-only)', 'permission denied for function erp_set_password',
+  $$SET LOCAL ROLE erp_auth$$, $$SELECT erp_set_password(u(9002), '$argon2id$v=19$m=65536,t=3,p=4$eA$eA')$$);
+SELECT t_err('login: the application cannot record login results', 'permission denied for function erp_record_login_result',
+  $$SELECT erp_record_login_result(u(9005), false)$$);
+SELECT t_err('login: internal acting is not callable by the application', 'permission denied for function erp_act_as_internal',
+  $$SELECT erp_act_as_internal(u(9999))$$);
+SELECT t_ok_nobody('login: setup stores a password hash for an employee (owner)',
+  $$SET LOCAL ROLE postgres$$, $$SELECT erp_set_password(u(9002), '$argon2id$v=19$m=65536,t=3,p=4$ZGF0YWVudHJ5$aGFzaA')$$);
+SELECT t_true('login: password setup is audited as the employee, without the hash',
+  $$EXISTS (SELECT 1 FROM audit_events WHERE entity_type = 'user_credentials' AND entity_id = u(9002)::text
+              AND action = 'credential_create' AND actor_id = u(9002) AND NOT (new_values ? 'password_hash'))$$);
+SELECT t_err_nobody('login: setup refuses the system user', 'never the system user',
+  $$SET LOCAL ROLE postgres$$, $$SELECT erp_set_password(erp_system_user_id(), '$argon2id$v=19$m=65536,t=3,p=4$eA$eA')$$);
+SELECT t_ok_nobody('login: four failed logins do not lock the account yet',
+  $$SET LOCAL ROLE erp_auth$$,
+  $$SELECT erp_record_login_result(u(9005), false) FROM generate_series(1, 4)$$,
+  $$DO $x$ BEGIN IF (SELECT locked_until FROM user_credentials WHERE user_id = u(9005)) IS NOT NULL
+                   OR (SELECT failed_login_count FROM user_credentials WHERE user_id = u(9005)) <> 4 THEN
+                  RAISE EXCEPTION 'unexpected lock state'; END IF; END $x$ $$);
+SELECT t_ok_nobody('login: the fifth failed login locks the account for 15 minutes',
+  $$SET LOCAL ROLE erp_auth$$,
+  $$SELECT erp_record_login_result(u(9005), false)$$,
+  $$DO $x$ BEGIN IF (SELECT locked_until FROM user_credentials WHERE user_id = u(9005))
+                     NOT BETWEEN now() + interval '14 minutes' AND now() + interval '16 minutes' THEN
+                  RAISE EXCEPTION 'account not locked'; END IF; END $x$ $$);
+SELECT t_ok_nobody('login: a successful login clears the lock and records the login time',
+  $$SET LOCAL ROLE erp_auth$$,
+  $$SELECT erp_record_login_result(u(9005), true)$$,
+  $$DO $x$ BEGIN IF (SELECT (failed_login_count, locked_until IS NULL, last_login_at IS NOT NULL)
+                       FROM user_credentials WHERE user_id = u(9005)) <> (0, true, true) THEN
+                  RAISE EXCEPTION 'lock not cleared'; END IF; END $x$ $$);
+SELECT t_true('login: failed attempts and lockout are audited as the employee''s own account',
+  $$(SELECT count(*) FROM audit_events WHERE entity_type = 'user_credentials' AND entity_id = u(9005)::text
+      AND action = 'credential_update' AND actor_id = u(9005)) = 6$$);
+
 -- ---------------------------------------------------------------------------
 -- Database role hardening
 -- ---------------------------------------------------------------------------
